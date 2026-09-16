@@ -124,7 +124,7 @@ def init_db():
     c.execute("SELECT COUNT(*) FROM users WHERE username = 'admin'")
     if c.fetchone()[0] == 0:
         c.execute('''INSERT INTO users VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)''',
-                  ("usr-admin", "admin", hash_password("admin123"), "Administrador Principal",
+                  ("usr-admin", "admin", hash_password("Matgozmaster2026#"), "Administrador Principal",
                    "admin@matgoz.com", "admin", "active", "all", datetime.now().isoformat()))
 
     conn.commit()
