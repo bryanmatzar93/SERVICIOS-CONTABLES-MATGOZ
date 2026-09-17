@@ -120,12 +120,14 @@ def init_db():
     if "forma_pago" not in cols:
         c.execute("ALTER TABLE facturas ADD COLUMN forma_pago TEXT DEFAULT 'Contado'")
 
-    # Usuario admin por defecto
+   # Usuario admin por defecto y actualización de clave
     c.execute("SELECT COUNT(*) FROM users WHERE username = 'admin'")
     if c.fetchone()[0] == 0:
         c.execute('''INSERT INTO users VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)''',
                   ("usr-admin", "admin", hash_password("Matgozmaster2026#"), "Administrador Principal",
                    "admin@matgoz.com", "admin", "active", "all", datetime.now().isoformat()))
+    else:
+        c.execute("UPDATE users SET password_hash = ? WHERE username = 'admin'", (hash_password("Matgozmaster2026#"),))
 
     conn.commit()
     conn.close()
@@ -209,7 +211,7 @@ def show_login():
     st.markdown("<div style='text-align:center; padding: 25px;'><h1 style='color:#1E3A8A;'>💼 Servicios Contables Matgoz</h1><p>Sistema ERP y Contabilidad Multiempresa</p></div>", unsafe_allow_html=True)
     _, c2, _ = st.columns([1, 1.6, 1])
     with c2:
-        st.info("💡 **Acceso:** Usuario: `admin` | Clave: `admin123`")
+        st.info("💡 **Acceso:** Usuario: `Matgoz`")
         u = st.text_input("Usuario")
         p = st.text_input("Contraseña", type="password")
         if st.button("Iniciar Sesión", type="primary", use_container_width=True):
