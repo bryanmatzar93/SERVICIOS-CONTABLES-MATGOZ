@@ -472,7 +472,7 @@ elif selected_menu == "👥 Directorio Terceros (Clientes/Proveedores)":
 # ==========================================
 # 3. FACTURA DE COMPRAS
 # ==========================================
-elif selected_menu == "🛒 Compras y Gastos":
+elif selected_menu in ["🛒 Factura de Compras", "🛒 Compras y Gastos"]:
     if not selected_emp_id:
         st.warning("Selecciona una empresa primero.")
         st.stop()
@@ -553,7 +553,7 @@ elif selected_menu == "🛒 Compras y Gastos":
 # ==========================================
 # 4. FACTURA DE VENTAS
 # ==========================================
-elif selected_menu == "📈 Facturación de Ventas":
+elif selected_menu in ["📈 Factura de Ventas", "📈 Facturación de Ventas"]:
     if not selected_emp_id:
         st.stop()
     st.title("📈 Facturación de Ventas Emitidas")
