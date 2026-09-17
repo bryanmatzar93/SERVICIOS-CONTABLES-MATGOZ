@@ -59,6 +59,68 @@ def exportar_libro_pdf(df_datos, titulo_libro, empresa_nom, empresa_nit, resoluc
     buffer.seek(0)
     return buffer
 from datetime import datetime, date
+import re
+from pypdf import PdfReader
+
+def extraer_datos_dte_sat(archivo_pdf):
+    lector = PdfReader(archivo_pdf)
+    texto = ""
+    for pagina in lector.pages:
+        t = pagina.extract_text()
+        if t:
+            texto += t + "\n"
+            
+    datos = {
+        "numero_dte": "",
+        "serie": "",
+        "fecha": None,
+        "emisor_nombre": "",
+        "emisor_nit": "",
+        "receptor_nombre": "",
+        "receptor_nit": "",
+        "total": 0.0,
+        "subtotal": 0.0
+    }
+    
+    # Expresiones regulares para formatos DTE / SAT Guatemala
+    m_aut = re.search(r'(?:NÚMERO DE AUTORIZACIÓN|Autorización|UUID)[:\s]+([A-F0-9\-]{36}|[A-F0-9]{32})', texto, re.I)
+    if m_aut:
+        datos["numero_dte"] = m_aut.group(1).strip()
+        
+    m_ser = re.search(r'(?:SERIE|Serie)[:\s]+([A-F0-9]{8,})', texto)
+    if m_ser:
+        datos["serie"] = m_ser.group(1).strip()
+        
+    m_dte_num = re.search(r'(?:NÚMERO DTE|Número)[:\s]+([0-9]{5,})', texto)
+    if m_dte_num and not datos["numero_dte"]:
+        datos["numero_dte"] = m_dte_num.group(1).strip()
+
+    m_fec = re.search(r'(\d{4}-\d{2}-\d{2}|\d{2}/\d{2}/\d{4})', texto)
+    if m_fec:
+        f_str = m_fec.group(1)
+        try:
+            if "-" in f_str:
+                datos["fecha"] = datetime.strptime(f_str, "%Y-%m-%d").date()
+            else:
+                datos["fecha"] = datetime.strptime(f_str, "%d/%m/%Y").date()
+        except:
+            pass
+
+    # Extracción de NITs (Emisor y Receptor)
+    nits = re.findall(r'(?:NIT|N\.I\.T\.)[:\s]*([0-9Kk\-]{4,12})', texto, re.I)
+    if len(nits) >= 1:
+        datos["emisor_nit"] = nits[0].replace("-", "").upper()
+    if len(nits) >= 2:
+        datos["receptor_nit"] = nits[1].replace("-", "").upper()
+
+    # Búsqueda del Gran Total
+    montos = re.findall(r'(?:TOTAL|Gran Total|Total General)[\s:]*(?:Q|GTQ)?\s*([\d,]+\.\d{2})', texto, re.I)
+    if montos:
+        m_val = float(montos[-1].replace(",", ""))
+        datos["total"] = m_val
+        datos["subtotal"] = round(m_val / 1.12, 2)
+        
+    return datos
 
 # ==========================================
 # CONFIGURACIÓN GENERAL
@@ -413,7 +475,17 @@ elif selected_menu == "👥 Directorio Terceros (Clientes/Proveedores)":
 elif selected_menu == "🛒 Factura de Compras":
     if not selected_emp_id: st.stop()
     st.title("🛒 Registro de Factura de Compra")
-
+# Lector automático de DTE (FEL SAT)
+    st.markdown("### 📥 Carga Inteligente de Factura Electrónica (PDF)")
+    dte_cargado = st.file_uploader("Sube el PDF emitido por SAT (FEL)", type=["pdf"], key="pdf_compra_fel")
+    
+    pre_datos = {}
+    if dte_cargado:
+        try:
+            pre_datos = extraer_datos_dte_sat(dte_cargado)
+            st.success("✅ Factura FEL procesada con éxito.")
+        except Exception:
+            st.warning("No se pudieron leer automáticamente todos los campos del archivo.")
     conn = get_db_connection()
     provs = conn.execute("SELECT nit, nombre FROM terceros WHERE empresa_id = ? AND tipo IN ('PROVEEDOR', 'AMBOS')", (selected_emp_id,)).fetchall()
     cuentas_gasto = pd.read_sql_query("SELECT codigo, nombre FROM nomenclatura WHERE empresa_id = ? AND (tipo = 'Gasto' OR tipo = 'Activo') ORDER BY codigo", conn, params=(selected_emp_id,))
@@ -426,15 +498,15 @@ elif selected_menu == "🛒 Factura de Compras":
 
     with st.expander("➕ Ingresar Nueva Compra", expanded=True):
         c1, c2, c3 = st.columns(3)
-        num_fac = c1.text_input("Número Factura / DTE *", key="c_num")
-        serie = c2.text_input("Serie", key="c_ser")
-        fecha_fac = c3.date_input("Fecha", value=date.today(), key="c_fec")
+        num_fac = c1.text_input("Número Factura / DTE *", value=pre_datos.get("numero_dte", ""), key="fc_num")
+        serie = c2.text_input("Serie", value=pre_datos.get("serie", ""), key="fc_ser")
+        fecha_fac = c3.date_input("Fecha", value=pre_datos.get("fecha") or date.today(), key="fc_fec")
 
         c4, c5 = st.columns(2)
         if dict_prov:
             prov_sel = c4.selectbox("Seleccionar Proveedor:", list(dict_prov.keys()), key="c_prv_sel")
-            prov_nom = dict_prov[prov_sel][1]
-            prov_nit = dict_prov[prov_sel][0]
+            prov_nombre = c4.text_input("Nombre Proveedor *", value=pre_datos.get("emisor_nombre", ""), key="fc_prv")
+            prov_nit = c5.text_input("NIT Proveedor *", value=pre_datos.get("emisor_nit", ""), key="fc_nit")
         else:
             c4.warning("No hay proveedores en el directorio.")
             prov_nom = c4.text_input("Nombre Proveedor *", key="c_pnom")
@@ -453,7 +525,7 @@ elif selected_menu == "🛒 Factura de Compras":
         cta_debe = cd1.selectbox("Cuenta de Cargo (DEBE) *", opc_debe if opc_debe else ["5.1.01.01 - Compras"], key="c_cdebe")
         cta_haber = cd2.selectbox("Cuenta de Abono (HABER) *", opc_haber if opc_haber else ["2.1.01.01 - Proveedores"], index=idx_h, key="c_chaber")
 
-        subtotal = st.number_input("Subtotal (Sin IVA) Q *", min_value=0.0, step=100.0, format="%.2f", key="c_sub")
+        subtotal = st.number_input("Subtotal (Sin IVA) Q *", min_value=0.0, step=50.0, format="%.2f", value=float(pre_datos.get("subtotal", 0.0)), key="fc_sub")
 
         r1, r2 = st.columns(2)
         aplica_isr = r1.checkbox("Practicar Retención ISR", value=(subtotal >= 2800.0), key="c_rk")
