@@ -3,6 +3,61 @@ import pandas as pd
 import sqlite3
 import hashlib
 import io
+from reportlab.lib.pagesizes import letter, landscape
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+
+def exportar_libro_pdf(df_datos, titulo_libro, empresa_nom, empresa_nit, resolucion_sat, folio_inicio=1):
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=landscape(letter),
+        leftMargin=30, rightMargin=30, topMargin=35, bottomMargin=40
+    )
+    elementos = []
+    estilos = getSampleStyleSheet()
+    
+    # Encabezado Oficial
+    estilo_titulo = ParagraphStyle('T1', parent=estilos['Normal'], fontName='Helvetica-Bold', fontSize=13, alignment=1, textColor=colors.HexColor("#1E3A8A"))
+    estilo_sub = ParagraphStyle('T2', parent=estilos['Normal'], fontName='Helvetica', fontSize=9, alignment=1)
+    
+    elementos.append(Paragraph(f"<b>{empresa_nom.upper()}</b>", estilo_titulo))
+    elementos.append(Paragraph(f"NIT: {empresa_nit} | <b>{titulo_libro.upper()}</b>", estilo_sub))
+    elementos.append(Paragraph(f"Resolución SAT No.: {resolucion_sat}", estilo_sub))
+    elementos.append(Spacer(1, 12))
+    
+    # Construir tabla
+    datos_tabla = [[Paragraph(f"<b>{c}</b>", estilos['Normal']) for c in df_datos.columns]]
+    for _, fila in df_datos.iterrows():
+        fila_txt = []
+        for val in fila:
+            texto = f"Q {val:,.2f}" if isinstance(val, (int, float)) else str(val or "")
+            fila_txt.append(Paragraph(texto, ParagraphStyle('Celda', parent=estilos['Normal'], fontSize=8)))
+        datos_tabla.append(fila_txt)
+        
+    t = Table(datos_tabla, repeatRows=1)
+    t.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#E2E8F0")),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('INNERGRID', (0, 0), (-1, -1), 0.5, colors.HexColor("#CBD5E1")),
+        ('BOX', (0, 0), (-1, -1), 1, colors.HexColor("#64748B")),
+    ]))
+    elementos.append(t)
+    
+    # Foliado SAT
+    def agregar_pie_sat(canvas, d):
+        canvas.saveState()
+        canvas.setFont('Helvetica', 8)
+        folio_actual = folio_inicio + canvas._pageNumber - 1
+        pie_txt = f"Folio No. {folio_actual}  |  Resolución SAT: {resolucion_sat}"
+        canvas.drawRightString(760, 20, pie_txt)
+        canvas.restoreState()
+
+    doc.build(elementos, onFirstPage=agregar_pie_sat, onLaterPages=agregar_pie_sat)
+    buffer.seek(0)
+    return buffer
 from datetime import datetime, date
 
 # ==========================================
@@ -829,56 +884,231 @@ elif selected_menu == "🗂️ Nomenclatura Contable":
 # 16. CONTROL DE USUARIOS (ADMIN)
 # ==========================================
 elif selected_menu == "👥 Control de Usuarios (Admin)":
-    if not is_admin: st.stop()
-    st.title("👥 Control de Operadores")
+    if not is_admin: 
+        st.stop()
+        
+    st.title("👥 Control de Operadores y Asignación de Empresas")
+    
     conn = get_db_connection()
-    u_list = conn.execute("SELECT id, username, name, email, status, assigned_empresas FROM users WHERE role != 'admin'").fetchall()
-    all_e = conn.execute("SELECT id, nombre, nit FROM empresas").fetchall()
+    c = conn.cursor()
+    c.execute("SELECT id, username, name, email, role, status, assigned_empresas FROM users WHERE role != 'admin'")
+    users_list = c.fetchall()
+    c.execute("SELECT id, nombre, nit FROM empresas ORDER BY nombre")
+    all_emps = c.fetchall()
     conn.close()
-    with st.form("crear_op"):
-        u1, u2 = st.columns(2)
-        un = u1.text_input("Usuario")
-        no = u2.text_input("Nombre")
-        p1, p2 = st.columns(2)
-        em = p1.text_input("Correo")
-        pw = p2.text_input("Contraseña", type="password")
-        emps_asig = [e[0] for e in all_e if st.checkbox(f"{e[1]}", key=f"as_{e[0]}", value=True)]
-        if st.form_submit_button("Crear Operador"):
-            conn = get_db_connection()
-            try:
-                conn.execute("INSERT INTO users VALUES (?, ?, ?, ?, ?, 'operator', 'active', ?, ?, 0)",
-                             (f"usr-{int(datetime.now().timestamp())}", un, hash_password(pw), no, em, ",".join(emps_asig), datetime.now().isoformat()))
-                conn.commit()
-                st.success("Operador creado.")
-                st.rerun()
-            except sqlite3.IntegrityError:
-                st.error("El usuario ya existe.")
-            conn.close()
 
+    dict_emps = {e[0]: f"{e[1]} (NIT: {e[2]})" for e in all_emps}
+
+    tab_crear, tab_registrados = st.tabs(["➕ Crear Nuevo Usuario", "📋 Usuarios Registrados y Accesos"])
+
+    with tab_crear:
+        with st.form("crear_usuario_form"):
+            c1, c2 = st.columns(2)
+            u_user = c1.text_input("Usuario (ej: operador1) *")
+            u_nombre = c2.text_input("Nombre Completo *")
+
+            c3, c4 = st.columns(2)
+            u_email = c3.text_input("Correo Electrónico")
+            u_pass = c4.text_input("Contraseña de Acceso *", type="password")
+
+            rol_opcion = st.selectbox("Perfil / Rol:", ["Operador (Solo Registra Facturas)", "Supervisor (Auditoría y Reportes)"])
+            rol_final = "supervisor" if "Supervisor" in rol_opcion else "operator"
+
+            st.markdown("##### 🏢 Empresas a las que tendrá acceso:")
+            empresas_seleccionadas = []
+            for emp in all_emps:
+                if st.checkbox(f"{emp[1]} (NIT: {emp[2]})", key=f"new_emp_{emp[0]}", value=True):
+                    empresas_seleccionadas.append(emp[0])
+
+            if st.form_submit_button("✅ Crear Usuario", type="primary"):
+                if u_user.strip() and u_nombre.strip() and u_pass.strip():
+                    conn = get_db_connection()
+                    c = conn.cursor()
+                    try:
+                        assigned_txt = ",".join(empresas_seleccionadas)
+                        uid = f"usr-{int(datetime.now().timestamp())}"
+                        c.execute('''
+                            INSERT INTO users (id, username, password_hash, name, email, role, status, assigned_empresas, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ''', (uid, u_user.strip(), hash_password(u_pass.strip()), u_nombre.strip(), u_email.strip(), rol_final, "active", assigned_txt, datetime.now().isoformat()))
+                        conn.commit()
+                        st.success(f"Usuario '@{u_user}' creado exitosamente.")
+                        st.rerun()
+                    except sqlite3.IntegrityError:
+                        st.error("El nombre de usuario ya existe.")
+                    finally:
+                        conn.close()
+                else:
+                    st.error("Completa el Usuario, Nombre y Contraseña.")
+
+    with tab_registrados:
+        st.subheader("Directorio de Cuentas")
+        if not users_list:
+            st.info("No hay operadores registrados aún.")
+        else:
+            for u in users_list:
+                uid, uname, name, email, role, status, assigned = u
+                with st.expander(f"👤 {name} (@{uname}) — Perfil: {role.upper()}"):
+                    col1, col2 = st.columns([1.5, 2])
+                    
+                    with col1:
+                        st.write(f"**Usuario:** `{uname}`")
+                        st.write(f"**Correo:** {email or 'Sin registrar'}")
+                        st.write(f"**Estado:** `{status}`")
+                        
+                        nueva_clave = st.text_input(f"Restablecer clave de @{uname}", type="password", key=f"pwd_{uid}")
+                        if st.button(f"🔑 Actualizar Clave", key=f"btn_pwd_{uid}"):
+                            if nueva_clave.strip():
+                                conn = get_db_connection()
+                                c = conn.cursor()
+                                c.execute("UPDATE users SET password_hash = ? WHERE id = ?", (hash_password(nueva_clave.strip()), uid))
+                                conn.commit()
+                                conn.close()
+                                st.success("Clave cambiada.")
+                            else:
+                                st.error("Ingresa una contraseña válida.")
+
+                    with col2:
+                        st.markdown("**🏢 Empresas Autorizadas:**")
+                        ids_asig = [x.strip() for x in (assigned or "").split(",") if x.strip()]
+                        if not ids_asig:
+                            st.warning("Sin empresas asignadas.")
+                        else:
+                            for eid in ids_asig:
+                                st.markdown(f"- **{dict_emps.get(eid, 'Empresa no encontrada')}**")
+
+                        st.markdown("---")
+                        st.caption("Modificar permisos de empresas:")
+                        nuevos_accesos = []
+                        for emp in all_emps:
+                            tiene = emp[0] in ids_asig
+                            if st.checkbox(f"{emp[1]}", value=tiene, key=f"chk_{uid}_{emp[0]}"):
+                                nuevos_accesos.append(emp[0])
+
+                        if st.button(f"💾 Guardar Empresas para @{uname}", key=f"btn_save_{uid}"):
+                            conn = get_db_connection()
+                            c = conn.cursor()
+                            c.execute("UPDATE users SET assigned_empresas = ? WHERE id = ?", (",".join(nuevos_accesos), uid))
+                            conn.commit()
+                            conn.close()
+                            st.success("Permisos actualizados.")
+                            st.rerun()
 # ==========================================
 # 17. GESTIÓN DE EMPRESAS (ADMIN)
 # ==========================================
 elif selected_menu == "🏢 Gestión de Empresas (Admin)":
-    if not is_admin: st.stop()
-    st.title("🏢 Registro de Empresas")
-    with st.form("f_emp"):
-        c1, c2 = st.columns(2)
-        en = c1.text_input("Razón Social *")
-        nt = c2.text_input("NIT *")
-        c3, c4 = st.columns(2)
-        dr = c3.text_input("Dirección")
-        tl = c4.text_input("Teléfono")
-        rg = st.selectbox("Régimen de ISR SAT", ["Opcional Simplificado (5% y 7%)", "Sobre las Utilidades (25%)", "Pequeño Contribuyente (5%)"])
-        if st.form_submit_button("Guardar Empresa"):
-            if en and nt:
-                conn = get_db_connection()
-                try:
-                    eid = f"emp-{int(datetime.now().timestamp())}"
-                    conn.execute("INSERT INTO empresas VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (eid, en, nt, dr, tl, rg, "Contabilidad", datetime.now().isoformat()))
-                    conn.commit()
-                    sembrar_nomenclatura_inicial(eid)
-                    st.success("Empresa registrada.")
-                    st.rerun()
-                except sqlite3.IntegrityError:
-                    st.error("NIT ya registrado.")
-                conn.close()
+    if not is_admin: 
+        st.error("Acceso exclusivo para el Administrador.")
+        st.stop()
+        
+    st.title("🏢 Gestión y Modificación de Empresas Fiscales")
+    
+    tab_nueva_emp, tab_lista_emp = st.tabs(["➕ Registrar Nueva Empresa", "📋 Consultar y Modificar Empresas"])
+    
+    with tab_nueva_emp:
+        with st.form("form_nueva_empresa"):
+            st.subheader("➕ Datos de la Nueva Empresa")
+            c1, c2 = st.columns(2)
+            e_nom = c1.text_input("Razón Social / Nombre Comercial *")
+            e_nit = c2.text_input("NIT de la Empresa *")
+            
+            c3, c4 = st.columns(2)
+            e_dir = c3.text_input("Dirección Fiscal")
+            e_tel = c4.text_input("Teléfono de Contacto")
+            
+            e_reg = st.selectbox("Régimen de ISR SAT", [
+                "Opcional Simplificado (5% y 7%)",
+                "Sobre las Utilidades de Actividades Lucrativas (25%)",
+                "Pequeño Contribuyente (5%)"
+            ])
+            
+            if st.form_submit_button("✅ Guardar Empresa", type="primary"):
+                if e_nom.strip() and e_nit.strip():
+                    conn = get_db_connection()
+                    c = conn.cursor()
+                    try:
+                        eid = f"emp-{int(datetime.now().timestamp())}"
+                        c.execute('''
+                            INSERT INTO empresas (id, nombre, nit, direccion, telefono, regimen_isr, actividad_economica, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ''', (eid, e_nom.strip(), e_nit.strip(), e_dir.strip(), e_tel.strip(), e_reg, "Servicios Contables", datetime.now().isoformat()))
+                        conn.commit()
+                        sembrar_nomenclatura_inicial(eid)
+                        st.success(f"✅ Empresa '{e_nom}' registrada con éxito.")
+                        st.rerun()
+                    except sqlite3.IntegrityError:
+                        st.error("Ya existe una empresa registrada con ese número de NIT.")
+                    finally:
+                        conn.close()
+                else:
+                    st.error("Completa el Nombre y el NIT.")
+
+    with tab_lista_emp:
+        st.subheader("Directorio de Entidades Registradas")
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute("SELECT id, nombre, nit, direccion, telefono, regimen_isr, created_at FROM empresas ORDER BY nombre")
+        empresas_registradas = c.fetchall()
+        conn.close()
+        
+        if not empresas_registradas:
+            st.info("No hay empresas registradas aún.")
+        else:
+            for emp in empresas_registradas:
+                e_id, nom, nit, dire, tel, reg, fec_crea = emp
+                with st.expander(f"🏢 {nom} — NIT: {nit}", expanded=False):
+                    st.caption(f"Fecha de Creación: {fec_crea or 'No disponible'}")
+                    
+                    with st.form(f"form_modificar_{e_id}"):
+                        c1, c2 = st.columns(2)
+                        nuevo_nom = c1.text_input("Nombre / Razón Social *", value=nom)
+                        nuevo_nit = c2.text_input("NIT Fiscal *", value=nit)
+                        
+                        c3, c4 = st.columns(2)
+                        nueva_dir = c3.text_input("Dirección Fiscal", value=dire or "")
+                        nuevo_tel = c4.text_input("Teléfono", value=tel or "")
+                        
+                        regimenes = [
+                            "Opcional Simplificado (5% y 7%)",
+                            "Sobre las Utilidades de Actividades Lucrativas (25%)",
+                            "Pequeño Contribuyente (5%)"
+                        ]
+                        idx_reg = regimenes.index(reg) if reg in regimenes else 0
+                        nuevo_reg = st.selectbox("Régimen Tributario SAT", regimenes, index=idx_reg)
+                        
+                        btn_col1, btn_col2 = st.columns([1.5, 1])
+                        guardar_cambios = btn_col1.form_submit_button("💾 Guardar Cambios de la Empresa", type="primary")
+                        
+                        if guardar_cambios:
+                            if nuevo_nom.strip() and nuevo_nit.strip():
+                                conn = get_db_connection()
+                                c = conn.cursor()
+                                try:
+                                    c.execute('''
+                                        UPDATE empresas 
+                                        SET nombre = ?, nit = ?, direccion = ?, telefono = ?, regimen_isr = ?
+                                        WHERE id = ?
+                                    ''', (nuevo_nom.strip(), nuevo_nit.strip(), nueva_dir.strip(), nuevo_tel.strip(), nuevo_reg, e_id))
+                                    conn.commit()
+                                    st.success(f"Datos de '{nuevo_nom}' actualizados exitosamente.")
+                                    st.rerun()
+                                except sqlite3.IntegrityError:
+                                    st.error("El NIT ingresado ya le pertenece a otra empresa.")
+                                finally:
+                                    conn.close()
+                            else:
+                                st.error("El Nombre y el NIT no pueden quedar vacíos.")
+                    
+                    # Botón para borrar empresa con advertencia
+                    st.markdown("---")
+                    if st.button(f"🗑️ Eliminar Empresa '{nom}'", key=f"del_emp_{e_id}"):
+                        conn = get_db_connection()
+                        c = conn.cursor()
+                        c.execute("DELETE FROM facturas WHERE empresa_id = ?", (e_id,))
+                        c.execute("DELETE FROM libro_diario WHERE empresa_id = ?", (e_id,))
+                        c.execute("DELETE FROM nomenclatura WHERE empresa_id = ?", (e_id,))
+                        c.execute("DELETE FROM empresas WHERE id = ?", (e_id,))
+                        conn.commit()
+                        conn.close()
+                        st.warning(f"Empresa '{nom}' y todos sus registros vinculados fueron eliminados.")
+                        st.rerun()
