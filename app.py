@@ -1,3 +1,4 @@
+import psycopg2
 import streamlit as st
 import pandas as pd
 import hashlib
@@ -141,9 +142,8 @@ st.markdown("""
 
 
 def get_db_connection():
-    # Se conecta a Supabase mediante la URL configurada en Secrets
-    conn = st.connection("supabase", type="sql")
-    return conn.raw_connection()
+    db_url = st.secrets["DATABASE_URL"]
+    return psycopg2.connect(db_url)
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
@@ -256,7 +256,7 @@ def init_db():
     conn.commit()
     conn.close()
 
-init_db()
+# init_db()
 
 def sembrar_nomenclatura_inicial(empresa_id):
     conn = get_db_connection()
