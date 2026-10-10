@@ -1,6 +1,7 @@
 streamlit
 pandas
-openpyxl
-psycopg2-binary
 reportlab
 pypdf
+openpyxl
+psycopg2-binary
+SQLAlchemy

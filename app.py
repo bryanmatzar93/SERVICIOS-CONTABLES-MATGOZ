@@ -1,6 +1,5 @@
 import streamlit as st
 import pandas as pd
-import sqlite3
 import hashlib
 import io
 import re
@@ -139,11 +138,12 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-DB_NAME = "matgoz_sistema_prod.db"
+
 
 def get_db_connection():
-    return sqlite3.connect(DB_NAME)
-
+    # Se conecta a Supabase mediante la URL configurada en Secrets
+    conn = st.connection("supabase", type="sql")
+    return conn.raw_connection()
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
