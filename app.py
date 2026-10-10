@@ -341,7 +341,7 @@ def show_login():
         if st.button("Iniciar Sesión", type="primary", use_container_width=True):
             conn = get_db_connection()
             c = conn.cursor()
-            c.execute("SELECT id, username, name, email, role, status, assigned_empresas FROM users WHERE username = ? AND password_hash = ?", (u, hash_password(p)))
+            c.execute("SELECT id, username, name, email, role, status, assigned_empresas FROM users WHERE username = %s AND password_hash = %s", (u, hash_password(p)))
             row = c.fetchone()
             conn.close()
             if row:
