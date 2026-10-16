@@ -352,7 +352,7 @@ with st.sidebar:
         "📈 Factura de Ventas",
         "📋 Libro de Compras (SAT)",
         "📋 Libro de Ventas (SAT)",
-        "📦 Control de Inventarios (Kárdex)",
+        "📦 Catálogo de Artículos e Inventarios",
         "💰 Cuentas por Cobrar (Clientes)",
         "💳 Cuentas por Pagar (Proveedores)",
         "🏦 Cuentas Bancarias",
@@ -370,7 +370,7 @@ with st.sidebar:
     selected_menu = st.radio("Navegación:", menu_options)
 
 # ==============================================================================
-# 🛒 FACTURA DE COMPRAS
+# 🛒 FACTURA DE COMPRAS (ALIMENTA EL INVENTARIO/KÁRDEX)
 # ==============================================================================
 if selected_menu == "🛒 Factura de Compras":
     if not selected_emp_id: st.stop()
@@ -380,6 +380,7 @@ if selected_menu == "🛒 Factura de Compras":
     conn = get_db_connection()
     cuentas_gasto = pd.read_sql_query("SELECT codigo, nombre FROM nomenclatura WHERE empresa_id = %s AND (tipo = 'Gasto' OR tipo = 'Activo') ORDER BY codigo", conn, params=(selected_emp_id,))
     prov_corp = pd.read_sql_query("SELECT nit, nombre FROM terceros_corp WHERE tipo IN ('PROVEEDOR', 'AMBOS') ORDER BY nombre", conn)
+    prods_compra = pd.read_sql_query("SELECT id, codigo, descripcion, existencia, costo_promedio FROM productos WHERE empresa_id = %s ORDER BY codigo ASC", conn, params=(selected_emp_id,))
     conn.close()
 
     opciones_cuentas = [f"{r['codigo']} - {r['nombre']}" for _, r in cuentas_gasto.iterrows()]
@@ -424,10 +425,25 @@ if selected_menu == "🛒 Factura de Compras":
 
             c6, c7 = st.columns(2)
             tipo_gasto = c6.selectbox("Concepto", ["Mercaderías e Inventarios", "Servicios Profesionales", "Arrendamientos", "Suministros", "Combustibles", "Otros Gastos"])
-            cuenta_nom = c7.selectbox("Cuenta de Gasto (Debe) *", opciones_cuentas if opciones_cuentas else ["5.1.01.01 - Costo de Ventas / Compras de Mercadería"])
+            
+            # Si es mercadería, sugerir cuenta de inventario o costo
+            cuenta_nom = c7.selectbox("Cuenta Contable (Debe) *", opciones_cuentas if opciones_cuentas else ["5.1.01.01 - Costo de Ventas / Compras de Mercadería"])
 
             tot_input = st.number_input("Monto Total de la Factura (Q) *", min_value=0.0, step=50.0, format="%.2f", value=float(pre_c.get("total", 0.0)))
             es_peq = st.checkbox("¿Factura de Pequeño Contribuyente? (No genera Crédito Fiscal)", value=pre_c.get("es_pequeno_contribuyente", es_peq_empresa))
+
+            # Opción si alimenta Kárdex de un producto existente
+            prod_asoc = None
+            cant_comprada = 0.0
+            if tipo_gasto == "Mercaderías e Inventarios" and not prods_compra.empty:
+                st.markdown("---")
+                st.caption("📦 **Entrada a Kárdex (Opcional si deseas registrar entrada de unidades específicas):**")
+                pk1, pk2 = st.columns([2, 1])
+                opc_prod_k = ["-- Registrar solo gasto contable sin mover unidades --"] + [f"{r['codigo']} - {r['descripcion']} (Stock: {r['existencia']})" for _, r in prods_compra.iterrows()]
+                sel_pk = pk1.selectbox("Producto a ingresar:", opc_prod_k)
+                cant_comprada = pk2.number_input("Cantidad de unidades compradas:", min_value=0.0, step=1.0)
+                if sel_pk != "-- Registrar solo gasto contable sin mover unidades --":
+                    prod_asoc = sel_pk.split(" - ")[0]
 
             r1, r2 = st.columns(2)
             aplica_isr = r1.checkbox("Practicar Retención ISR", value=False)
@@ -457,6 +473,22 @@ if selected_menu == "🛒 Factura de Compras":
                           1 if (aplica_isr and tipo_isr != "No Aplica") else 0, t_isr, m_isr,
                           1 if (aplica_iva and "No Aplica" not in tipo_iva) else 0, t_iva, m_iva, liq, curr_u['username'], datetime.now().isoformat()))
 
+                    # Alimentar Kárdex si se seleccionó producto y cantidad > 0
+                    if prod_asoc and cant_comprada > 0:
+                        costo_u = round(base / cant_comprada, 2)
+                        c.execute("SELECT id, existencia, costo_promedio FROM productos WHERE empresa_id = %s AND codigo = %s", (selected_emp_id, prod_asoc))
+                        p_row = c.fetchone()
+                        if p_row:
+                            p_id_k, ex_ant, c_ant = p_row[0], float(p_row[1] or 0), float(p_row[2] or 0)
+                            nueva_ex = ex_ant + cant_comprada
+                            nuevo_costo_prom = round(((ex_ant * c_ant) + base) / nueva_ex, 2) if nueva_ex > 0 else costo_u
+                            c.execute("UPDATE productos SET existencia = %s, costo_promedio = %s WHERE id = %s", (nueva_ex, nuevo_costo_prom, p_id_k))
+                            c.execute("""
+                                INSERT INTO kardex (id, empresa_id, producto_id, fecha, tipo_movimiento, cantidad, costo_unitario, total, documento_ref, created_at)
+                                VALUES (%s, %s, %s, %s, 'COMPRA', %s, %s, %s, %s, %s)
+                            """, (f"kdx-{int(datetime.now().timestamp())}", selected_emp_id, p_id_k, str(fecha_fac), cant_comprada, costo_u, base, num_fac, datetime.now().isoformat()))
+
+                    # Asiento en Libro Diario
                     c.execute("SELECT COALESCE(MAX(partida_no), 0) + 1 FROM libro_diario WHERE empresa_id = %s", (selected_emp_id,))
                     p_no = c.fetchone()[0]
                     now_str = datetime.now().isoformat()
@@ -554,7 +586,7 @@ if selected_menu == "🛒 Factura de Compras":
                     st.rerun()
 
 # ==============================================================================
-# 📈 FACTURA DE VENTAS (CON BÚSQUEDA DE PRODUCTO POR CÓDIGO O DESCRIPCIÓN)
+# 📈 FACTURA DE VENTAS (BUSCADOR POR DESCRIPCIÓN Y CÓDIGO)
 # ==============================================================================
 elif selected_menu == "📈 Factura de Ventas":
     if not selected_emp_id: st.stop()
@@ -826,56 +858,63 @@ elif selected_menu == "📋 Libro de Ventas (SAT)":
             st.download_button("📄 Descargar Libro en PDF", pdf_bv, f"Libro_Ventas_{selected_empresa_info[2]}.pdf", "application/pdf")
 
 # ==============================================================================
-# 📦 CONTROL DE INVENTARIOS (KÁRDEX - SECUENCIA 1 A 1,000,000)
+# 📦 CATÁLOGO DE ARTÍCULOS E INVENTARIOS (KÁRDEX)
 # ==============================================================================
-elif selected_menu == "📦 Control de Inventarios (Kárdex)":
+elif selected_menu == "📦 Catálogo de Artículos e Inventarios":
     if not selected_emp_id: st.stop()
-    st.title(f"📦 Control de Inventarios y Kárdex — {selected_empresa_info[1]}")
+    st.title(f"📦 Catálogo de Artículos y Kárdex — {selected_empresa_info[1]}")
     
-    # Calcular correlativo sugerido automático (1 a 1,000,000)
     sig_cod_auto = obtener_siguiente_codigo_articulo(selected_emp_id)
 
-    with st.expander("➕ Crear Nuevo Producto en Inventario", expanded=True):
+    with st.expander("➕ Dar de Alta Nuevo Artículo al Catálogo", expanded=True):
+        st.info("💡 **Flujo:** Aquí creas el código y la descripción del producto. Las existencias y costos entrarán automáticamente cuando registres una **Factura de Compra**.")
         with st.form("form_prod_nuevo"):
             p1, p2, p3 = st.columns(3)
-            p_cod = p1.text_input("Código de Artículo (Secuencia 1 - 1,000,000) *", value=sig_cod_auto, help="Generado automáticamente en secuencia correlativa.")
+            p_cod = p1.text_input("Código de Artículo (Secuencia 1 - 1,000,000) *", value=sig_cod_auto)
             p_nom = p2.text_input("Descripción del Producto *")
-            p_pre = p3.number_input("Precio de Venta Sugerido (Referencial) Q", min_value=0.0, step=10.0, format="%.2f", help="Valor de referencia. Al facturar podrás modificar el precio libremente.")
+            p_pre = p3.number_input("Precio de Venta Sugerido (Referencial) Q", min_value=0.0, step=10.0, format="%.2f", help="Valor referencial para ventas. Podrás modificarlo al emitir cada factura.")
             
-            p4, p5 = st.columns(2)
-            p_stock_ini = p4.number_input("Inventario Inicial (Unidades)", min_value=0.0, step=1.0)
-            p_costo_ini = p5.number_input("Costo Unitario Inicial Q", min_value=0.0, step=10.0)
-
-            if st.form_submit_button("Guardar Producto", type="primary"):
+            if st.form_submit_button("Guardar Artículo en Catálogo", type="primary"):
                 if p_cod and p_nom:
                     conn = get_db_connection()
                     c = conn.cursor()
                     prod_id = f"prod-{int(datetime.now().timestamp())}"
                     c.execute("""
                         INSERT INTO productos (id, empresa_id, codigo, descripcion, existencia, costo_promedio, precio_venta, created_at)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                    """, (prod_id, selected_emp_id, p_cod.strip(), p_nom.strip(), p_stock_ini, p_costo_ini, p_pre, datetime.now().isoformat()))
-                    
-                    if p_stock_ini > 0:
-                        c.execute("""
-                            INSERT INTO kardex (id, empresa_id, producto_id, fecha, tipo_movimiento, cantidad, costo_unitario, total, documento_ref, created_at)
-                            VALUES (%s, %s, %s, %s, 'INVENTARIO INICIAL', %s, %s, %s, 'APERTURA', %s)
-                        """, (f"kdx-{int(datetime.now().timestamp())}", selected_emp_id, prod_id, str(date.today()), p_stock_ini, p_costo_ini, round(p_stock_ini * p_costo_ini, 2), datetime.now().isoformat()))
-                    
+                        VALUES (%s, %s, %s, %s, 0, 0, %s, %s)
+                    """, (prod_id, selected_emp_id, p_cod.strip(), p_nom.strip(), p_pre, datetime.now().isoformat()))
                     conn.commit()
                     conn.close()
-                    st.success(f"Producto '{p_nom}' guardado exitosamente con código {p_cod}.")
+                    st.success(f"Artículo '{p_nom}' guardado con código {p_cod}. Listo para recibir compras.")
                     st.rerun()
                 else:
                     st.error("Completa el código y la descripción.")
 
     conn = get_db_connection()
-    df_prods = pd.read_sql_query("SELECT codigo AS \"Código\", descripcion AS \"Descripción\", existencia AS \"Stock Actual\", costo_promedio AS \"Costo Promedio (Q)\", precio_venta AS \"Precio Sugerido (Q)\" FROM productos WHERE empresa_id = %s ORDER BY codigo ASC", conn, params=(selected_emp_id,))
+    df_prods = pd.read_sql_query("SELECT codigo AS \"Código\", descripcion AS \"Descripción\", existencia AS \"Stock Actual\", costo_promedio AS \"Costo Promedio (Q)\", precio_venta AS \"Precio Ref. (Q)\" FROM productos WHERE empresa_id = %s ORDER BY codigo ASC", conn, params=(selected_emp_id,))
+    df_kdx = pd.read_sql_query("""
+        SELECT k.fecha AS "Fecha", p.codigo AS "Código", p.descripcion AS "Producto",
+               k.tipo_movimiento AS "Movimiento", k.cantidad AS "Cantidad",
+               k.costo_unitario AS "Costo Unit. (Q)", k.total AS "Total (Q)",
+               k.documento_ref AS "Doc. Referencia"
+        FROM kardex k
+        JOIN productos p ON k.producto_id = p.id
+        WHERE k.empresa_id = %s
+        ORDER BY k.fecha DESC, k.id DESC
+    """, conn, params=(selected_emp_id,))
     conn.close()
-    if df_prods.empty:
-        st.info("No hay artículos registrados en el inventario.")
-    else:
-        st.dataframe(df_prods, use_container_width=True)
+
+    t_inv1, t_inv2 = st.tabs(["📋 Catálogo de Artículos y Existencias", "📜 Movimientos Históricos de Kárdex"])
+    with t_inv1:
+        if df_prods.empty:
+            st.info("No hay artículos registrados en el catálogo.")
+        else:
+            st.dataframe(df_prods, use_container_width=True)
+    with t_inv2:
+        if df_kdx.empty:
+            st.info("No hay movimientos de Kárdex registrados por compras o ventas.")
+        else:
+            st.dataframe(df_kdx, use_container_width=True)
 
 # ==============================================================================
 # 💰 CUENTAS POR COBRAR (CLIENTES)
