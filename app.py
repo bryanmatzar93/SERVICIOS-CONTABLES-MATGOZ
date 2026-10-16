@@ -212,7 +212,7 @@ def sembrar_nomenclatura_inicial(empresa_id):
     conn.close()
 
 # ==========================================
-# INICIALIZACIÓN DE TABLAS ADICIONALES
+# MIGRACIÓN Y ASEGURAMIENTO DE TABLAS
 # ==========================================
 def asegurar_tablas_adicionales():
     conn = get_db_connection()
@@ -228,6 +228,23 @@ def asegurar_tablas_adicionales():
             precio_venta NUMERIC DEFAULT 0,
             created_at TEXT
         );
+        ALTER TABLE productos ADD COLUMN IF NOT EXISTS existencia NUMERIC DEFAULT 0;
+        ALTER TABLE productos ADD COLUMN IF NOT EXISTS costo_promedio NUMERIC DEFAULT 0;
+        ALTER TABLE productos ADD COLUMN IF NOT EXISTS precio_venta NUMERIC DEFAULT 0;
+
+        CREATE TABLE IF NOT EXISTS kardex (
+            id TEXT PRIMARY KEY,
+            empresa_id TEXT NOT NULL,
+            producto_id TEXT NOT NULL,
+            fecha DATE NOT NULL,
+            tipo_movimiento TEXT NOT NULL,
+            cantidad NUMERIC NOT NULL,
+            costo_unitario NUMERIC NOT NULL,
+            total NUMERIC NOT NULL,
+            documento_ref TEXT,
+            created_at TEXT
+        );
+
         CREATE TABLE IF NOT EXISTS cuentas_bancarias (
             id TEXT PRIMARY KEY,
             empresa_id TEXT NOT NULL,
@@ -242,6 +259,23 @@ def asegurar_tablas_adicionales():
     conn.close()
 
 asegurar_tablas_adicionales()
+
+# Función para calcular siguiente correlativo (1 a 1,000,000)
+def obtener_siguiente_codigo_articulo(empresa_id):
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT codigo FROM productos WHERE empresa_id = %s", (empresa_id,))
+    filas = c.fetchall()
+    conn.close()
+    max_num = 0
+    for f in filas:
+        cod_str = str(f[0]).strip()
+        if cod_str.isdigit():
+            num = int(cod_str)
+            if num > max_num:
+                max_num = num
+    siguiente = max_num + 1
+    return str(min(siguiente, 1000000))
 
 # ==========================================
 # GESTIÓN DE SESIÓN
@@ -486,7 +520,6 @@ if selected_menu == "🛒 Factura de Compras":
                         WHERE id = %s
                     """, (edit_num, edit_ser, str(edit_fec), edit_nom, edit_nit, e_base, e_iva, e_total, e_liq, sel_fac_id))
 
-                    # Reconstrucción balanceada del asiento
                     c.execute("SELECT partida_no FROM libro_diario WHERE referencia_id = %s OR referencia_id = %s LIMIT 1", (sel_fac_id, f_act[0]))
                     row_p = c.fetchone()
                     p_num = row_p[0] if row_p else 1
@@ -521,7 +554,7 @@ if selected_menu == "🛒 Factura de Compras":
                     st.rerun()
 
 # ==============================================================================
-# 📈 FACTURA DE VENTAS
+# 📈 FACTURA DE VENTAS (CON BÚSQUEDA DE PRODUCTO POR CÓDIGO O DESCRIPCIÓN)
 # ==============================================================================
 elif selected_menu == "📈 Factura de Ventas":
     if not selected_emp_id: st.stop()
@@ -531,6 +564,7 @@ elif selected_menu == "📈 Factura de Ventas":
     conn = get_db_connection()
     cuentas_ing = pd.read_sql_query("SELECT codigo, nombre FROM nomenclatura WHERE empresa_id = %s AND tipo = 'Ingreso' ORDER BY codigo", conn, params=(selected_emp_id,))
     cli_corp = pd.read_sql_query("SELECT nit, nombre FROM terceros_corp WHERE tipo IN ('CLIENTE', 'AMBOS') ORDER BY nombre", conn)
+    prods_venta = pd.read_sql_query("SELECT id, codigo, descripcion, precio_venta, existencia FROM productos WHERE empresa_id = %s ORDER BY codigo ASC", conn, params=(selected_emp_id,))
     conn.close()
 
     opciones_ing = [f"{r['codigo']} - {r['nombre']}" for _, r in cuentas_ing.iterrows()]
@@ -562,7 +596,22 @@ elif selected_menu == "📈 Factura de Ventas":
 
         if val_c_nit in ["CF", "C/F"]: val_c_nom = "CONSUMIDOR FINAL"
 
-        st.markdown("### 📝 2. Detalle de la Venta")
+        # BUSCADOR INTERACTIVO DE PRODUCTOS POR CÓDIGO O DESCRIPCIÓN
+        st.markdown("### 📦 2. Seleccionar Artículo de Inventario (Opcional)")
+        busq_prod = st.text_input("🔎 Escribe para buscar Producto (por Código o Descripción):", key="busq_prod_txt")
+        prods_filtrados = prods_venta[prods_venta['descripcion'].str.contains(busq_prod, case=False, na=False) | prods_venta['codigo'].str.contains(busq_prod, case=False, na=False)] if busq_prod else prods_venta
+
+        opc_prods_list = ["-- Ninguno / Factura de Servicio o Venta Libre --"] + [f"Código: {r['codigo']} | {r['descripcion']} (Precio Ref: Q{r['precio_venta']:,.2f} | Stock: {r['existencia']})" for _, r in prods_filtrados.iterrows()]
+        sel_prod_drop = st.selectbox("Artículo seleccionado:", opc_prods_list, key="sel_prod_venta_drop")
+
+        precarga_total = float(pre_v.get("total", 0.0))
+        if sel_prod_drop != "-- Ninguno / Factura de Servicio o Venta Libre --" and precarga_total == 0.0:
+            cod_extraido = sel_prod_drop.split("Código: ")[1].split(" | ")[0]
+            prod_match = prods_venta[prods_venta['codigo'] == cod_extraido]
+            if not prod_match.empty:
+                precarga_total = float(prod_match.iloc[0]['precio_venta'])
+
+        st.markdown("### 📝 3. Detalle de la Venta")
         with st.form("form_venta_nueva"):
             c1, c2, c3 = st.columns(3)
             num_fac = c1.text_input("Número Factura / Autorización DTE *", value=pre_v.get("numero_dte", ""))
@@ -574,10 +623,10 @@ elif selected_menu == "📈 Factura de Ventas":
             cli_nit_final = c5.text_input("NIT del Cliente *", value=val_c_nit)
 
             c6, c7 = st.columns(2)
-            concepto = c6.selectbox("Concepto", ["Servicio de Transporte", "Servicios Contables y Profesionales", "Venta de Mercaderías", "Otros Ingresos"])
-            cuenta_ingreso = c7.selectbox("Cuenta de Ingreso (Haber) *", opciones_ing if opciones_ing else ["4.1.01.03 - Servicio de Transporte"])
+            concepto = c6.selectbox("Concepto", ["Venta de Mercaderías", "Servicio de Transporte", "Servicios Contables y Profesionales", "Otros Ingresos"])
+            cuenta_ingreso = c7.selectbox("Cuenta de Ingreso (Haber) *", opciones_ing if opciones_ing else ["4.1.01.01 - Ventas de Mercaderías"])
 
-            tot_input_v = st.number_input("Monto Total de la Factura (Q) *", min_value=0.0, step=50.0, format="%.2f", value=float(pre_v.get("total", 0.0)))
+            tot_input_v = st.number_input("Monto Total de la Factura (Q) * (Editable libremente)", min_value=0.0, step=50.0, format="%.2f", value=precarga_total)
             es_peq_v = st.checkbox("¿Régimen Pequeño Contribuyente? (No genera Débito Fiscal)", value=pre_v.get("es_pequeno_contribuyente", es_peq_empresa))
 
             r1, r2 = st.columns(2)
@@ -679,7 +728,7 @@ elif selected_menu == "📈 Factura de Ventas":
                     pv_num = row_pv[0] if row_pv else 1
                     now_str = datetime.now().isoformat()
                     conc = f"Fac. Venta {edit_v_num} a {edit_v_nom} (Corregida)"
-                    c_cod, c_nom_cta = (fv_act[8] or "4.1.01.03 - Servicio de Transporte").split(" - ", 1)
+                    c_cod, c_nom_cta = (fv_act[8] or "4.1.01.01 - Ventas de Mercaderías").split(" - ", 1)
 
                     c.execute("DELETE FROM libro_diario WHERE referencia_id = %s OR referencia_id = %s", (sel_v_id, fv_act[0]))
                     c.execute("INSERT INTO libro_diario (empresa_id, partida_no, fecha, codigo_cuenta, nombre_cuenta, debe, haber, concepto, referencia_id, created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
@@ -777,33 +826,51 @@ elif selected_menu == "📋 Libro de Ventas (SAT)":
             st.download_button("📄 Descargar Libro en PDF", pdf_bv, f"Libro_Ventas_{selected_empresa_info[2]}.pdf", "application/pdf")
 
 # ==============================================================================
-# 📦 CONTROL DE INVENTARIOS (KÁRDEX)
+# 📦 CONTROL DE INVENTARIOS (KÁRDEX - SECUENCIA 1 A 1,000,000)
 # ==============================================================================
 elif selected_menu == "📦 Control de Inventarios (Kárdex)":
     if not selected_emp_id: st.stop()
     st.title(f"📦 Control de Inventarios y Kárdex — {selected_empresa_info[1]}")
     
-    with st.expander("➕ Crear Nuevo Producto en Inventario", expanded=False):
+    # Calcular correlativo sugerido automático (1 a 1,000,000)
+    sig_cod_auto = obtener_siguiente_codigo_articulo(selected_emp_id)
+
+    with st.expander("➕ Crear Nuevo Producto en Inventario", expanded=True):
         with st.form("form_prod_nuevo"):
             p1, p2, p3 = st.columns(3)
-            p_cod = p1.text_input("Código de Artículo *")
-            p_nom = p2.text_input("Descripción *")
-            p_pre = p3.number_input("Precio de Venta Sugerido (Q)", min_value=0.0, step=10.0)
+            p_cod = p1.text_input("Código de Artículo (Secuencia 1 - 1,000,000) *", value=sig_cod_auto, help="Generado automáticamente en secuencia correlativa.")
+            p_nom = p2.text_input("Descripción del Producto *")
+            p_pre = p3.number_input("Precio de Venta Sugerido (Referencial) Q", min_value=0.0, step=10.0, format="%.2f", help="Valor de referencia. Al facturar podrás modificar el precio libremente.")
+            
+            p4, p5 = st.columns(2)
+            p_stock_ini = p4.number_input("Inventario Inicial (Unidades)", min_value=0.0, step=1.0)
+            p_costo_ini = p5.number_input("Costo Unitario Inicial Q", min_value=0.0, step=10.0)
+
             if st.form_submit_button("Guardar Producto", type="primary"):
                 if p_cod and p_nom:
                     conn = get_db_connection()
                     c = conn.cursor()
+                    prod_id = f"prod-{int(datetime.now().timestamp())}"
                     c.execute("""
                         INSERT INTO productos (id, empresa_id, codigo, descripcion, existencia, costo_promedio, precio_venta, created_at)
-                        VALUES (%s, %s, %s, %s, 0, 0, %s, %s)
-                    """, (f"prod-{int(datetime.now().timestamp())}", selected_emp_id, p_cod.strip(), p_nom.strip(), p_pre, datetime.now().isoformat()))
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """, (prod_id, selected_emp_id, p_cod.strip(), p_nom.strip(), p_stock_ini, p_costo_ini, p_pre, datetime.now().isoformat()))
+                    
+                    if p_stock_ini > 0:
+                        c.execute("""
+                            INSERT INTO kardex (id, empresa_id, producto_id, fecha, tipo_movimiento, cantidad, costo_unitario, total, documento_ref, created_at)
+                            VALUES (%s, %s, %s, %s, 'INVENTARIO INICIAL', %s, %s, %s, 'APERTURA', %s)
+                        """, (f"kdx-{int(datetime.now().timestamp())}", selected_emp_id, prod_id, str(date.today()), p_stock_ini, p_costo_ini, round(p_stock_ini * p_costo_ini, 2), datetime.now().isoformat()))
+                    
                     conn.commit()
                     conn.close()
-                    st.success(f"Producto '{p_nom}' creado con éxito.")
+                    st.success(f"Producto '{p_nom}' guardado exitosamente con código {p_cod}.")
                     st.rerun()
+                else:
+                    st.error("Completa el código y la descripción.")
 
     conn = get_db_connection()
-    df_prods = pd.read_sql_query("SELECT codigo AS \"Código\", descripcion AS \"Descripción\", existencia AS \"Stock Actual\", costo_promedio AS \"Costo Promedio (Q)\", precio_venta AS \"Precio Venta (Q)\" FROM productos WHERE empresa_id = %s ORDER BY codigo ASC", conn, params=(selected_emp_id,))
+    df_prods = pd.read_sql_query("SELECT codigo AS \"Código\", descripcion AS \"Descripción\", existencia AS \"Stock Actual\", costo_promedio AS \"Costo Promedio (Q)\", precio_venta AS \"Precio Sugerido (Q)\" FROM productos WHERE empresa_id = %s ORDER BY codigo ASC", conn, params=(selected_emp_id,))
     conn.close()
     if df_prods.empty:
         st.info("No hay artículos registrados en el inventario.")
@@ -1165,6 +1232,8 @@ elif selected_menu == "🗂️ Nomenclatura Contable":
                     except psycopg2.IntegrityError:
                         st.error("Ya existe una cuenta con este código en esta empresa.")
                     conn.close()
+                else:
+                    st.error("Completa el código y el nombre de la cuenta.")
 
     conn = get_db_connection()
     df_nom = pd.read_sql_query("SELECT codigo AS \"Código\", nombre AS \"Nombre de la Cuenta\", tipo AS \"Tipo\" FROM nomenclatura WHERE empresa_id = %s ORDER BY codigo ASC", conn, params=(selected_emp_id,))
@@ -1259,3 +1328,5 @@ elif selected_menu == "🏢 Gestión de Empresas (Admin)":
                 except psycopg2.IntegrityError:
                     st.error("Ya existe una empresa con ese NIT.")
                 conn.close()
+            else:
+                st.error("Completa el nombre y el NIT.")
