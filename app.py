@@ -944,4 +944,4 @@ elif selected_menu == "👥 Control de Usuarios (Admin)":
             u_mail = c3.text_input("Correo")
             u_pass = c4.text_input("Contraseña *", type="password")
             u_rol = st.selectbox("Rol Asignado:", ["operator", "supervisor"])
-            emp_sel = [emp[0] for emp in all_emps if st.checkbox(f"{emp[1]} (NIT: {emp[2]})", key=f"u_emp_{emp[0]}", value=
+            emp_sel = [emp[0] for emp in all_emps if st.checkbox(f"{emp[1]} (NIT: {emp[2]})", key=f"u_emp_{emp[0]}", value=True)]
