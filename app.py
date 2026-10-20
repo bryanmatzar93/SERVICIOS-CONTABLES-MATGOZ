@@ -144,12 +144,11 @@ def init_db():
             created_at TEXT
         );
     ''')
-    # TABLA CORPORATIVA DE PRODUCTOS (Persistente y compartida entre empresas)
+    # Tabla corporativa unificada de productos (compartida entre todas las empresas)
     c.execute('''
         CREATE TABLE IF NOT EXISTS productos_corp (
             id SERIAL PRIMARY KEY,
             codigo_correlativo INTEGER UNIQUE NOT NULL,
-            codigo_personalizado TEXT,
             descripcion TEXT NOT NULL,
             precio_costo NUMERIC DEFAULT 0,
             precio_venta NUMERIC DEFAULT 0,
@@ -160,7 +159,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS kardex (
             id TEXT PRIMARY KEY,
             empresa_id TEXT NOT NULL,
-            producto_id INTEGER NOT NULL,
+            producto_codigo INTEGER NOT NULL,
             fecha DATE NOT NULL,
             tipo_movimiento TEXT NOT NULL,
             cantidad NUMERIC NOT NULL,
@@ -170,21 +169,40 @@ def init_db():
             created_at TEXT
         );
     ''')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS activos_fijos (
-            id TEXT PRIMARY KEY,
-            empresa_id TEXT NOT NULL,
-            codigo_activo TEXT,
-            descripcion TEXT NOT NULL,
-            categoria TEXT NOT NULL,
-            fecha_adquisicion DATE NOT NULL,
-            costo_adquisicion NUMERIC NOT NULL,
-            vida_util_anios INTEGER DEFAULT 5,
-            porcentaje_depreciacion NUMERIC DEFAULT 20.0,
-            created_at TEXT
-        );
-    ''')
     conn.commit()
+
+    # Rutina de migración: Rescatar productos creados anteriormente en tablas previas
+    try:
+        c.execute("""
+            INSERT INTO productos_corp (codigo_correlativo, descripcion, precio_costo, precio_venta, created_at)
+            SELECT 
+                COALESCE(NULLIF(regexp_replace(codigo, '[^0-9]', '', 'g'), '')::integer, id),
+                descripcion,
+                COALESCE(costo_promedio, 0),
+                COALESCE(precio_venta, 0),
+                NOW()::text
+            FROM productos
+            ON CONFLICT (codigo_correlativo) DO NOTHING;
+        """)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+
+    try:
+        c.execute("""
+            INSERT INTO productos_corp (codigo_correlativo, descripcion, precio_costo, precio_venta, created_at)
+            SELECT 
+                COALESCE(NULLIF(regexp_replace(codigo, '[^0-9]', '', 'g'), '')::integer, 1),
+                descripcion,
+                COALESCE(precio_costo, 0),
+                COALESCE(precio_venta, 0),
+                NOW()::text
+            FROM productos_inventario
+            ON CONFLICT (codigo_correlativo) DO NOTHING;
+        """)
+        conn.commit()
+    except Exception:
+        conn.rollback()
 
     # Usuario admin inicial
     c.execute("SELECT COUNT(*) FROM users WHERE username = 'admin'")
@@ -976,7 +994,7 @@ elif selected_menu == "📋 Libro de Ventas (SAT)":
 # ==========================================
 elif selected_menu == "📦 Catálogo de Artículos e Inventarios":
     st.title("📦 Catálogo Corporativo de Artículos e Inventarios")
-    st.caption("Base global corporativa. Los códigos se generan en secuencia de 1 a 1,000,000 y están disponibles para todas las empresas.")
+    st.caption("Base global corporativa. Los productos son visibles y compartidos para todas las empresas de forma permanente.")
 
     conn = get_db_connection()
     c = conn.cursor()
@@ -986,8 +1004,8 @@ elif selected_menu == "📦 Catálogo de Artículos e Inventarios":
 
     with st.expander("➕ Registrar Producto en Catálogo Corporativo", expanded=True):
         col_c1, col_c2 = st.columns([1, 3])
-        p_correlativo = col_c1.number_input("Código Correlativo Automático (1 a 1,000,000):", value=int(siguiente_correlativo), min_value=1, max_value=1000000)
-        p_desc = col_c2.text_input("Descripción del Producto o Servicio *")
+        p_correlativo = col_c1.number_input("Código de Producto (Secuencia 1 a 1,000,000):", value=int(siguiente_correlativo), min_value=1, max_value=1000000)
+        p_desc = col_c2.text_input("Descripción del Producto o Mercadería *")
 
         p3, p4 = st.columns(2)
         p_cost = p3.number_input("Costo de Referencia Q", min_value=0.0, step=5.0)
@@ -1001,19 +1019,21 @@ elif selected_menu == "📦 Catálogo de Artículos e Inventarios":
                     c.execute("""
                         INSERT INTO productos_corp (codigo_correlativo, descripcion, precio_costo, precio_venta, created_at)
                         VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT (codigo_correlativo) DO UPDATE 
+                        SET descripcion = EXCLUDED.descripcion, precio_costo = EXCLUDED.precio_costo, precio_venta = EXCLUDED.precio_venta
                     """, (int(p_correlativo), p_desc.strip(), p_cost, p_vent, datetime.now().isoformat()))
                     conn.commit()
                     st.success(f"✅ Producto #{p_correlativo} - '{p_desc}' guardado permanentemente a nivel corporativo.")
                     st.rerun()
-                except psycopg2.IntegrityError:
-                    st.error("Ya existe un producto registrado con ese número correlativo.")
+                except Exception as ex:
+                    st.error(f"Error al guardar producto: {ex}")
                 finally:
                     conn.close()
             else:
                 st.error("Ingresa la descripción del artículo.")
 
     st.markdown("---")
-    st.subheader("Artículos Catalogados en el Sistema")
+    st.subheader("Artículos Catalogados en el Sistema Corporativo")
 
     conn = get_db_connection()
     df_prods = pd.read_sql_query("""
@@ -1029,11 +1049,11 @@ elif selected_menu == "📦 Catálogo de Artículos e Inventarios":
         st.dataframe(df_prods.drop(columns=['id']), use_container_width=True)
         
         if is_admin:
-            with st.expander("🔒 Opciones de Administrador (Eliminar Producto)", expanded=False):
+            with st.expander("🔒 Eliminar Producto (Exclusivo Administrador)", expanded=False):
                 prod_map = {f"#{r['Código']} - {r['Descripción']}": r['id'] for _, r in df_prods.iterrows()}
-                p_del_label = st.selectbox("Seleccionar producto para dar de baja:", list(prod_map.keys()))
+                p_del_label = st.selectbox("Seleccionar producto para eliminar:", list(prod_map.keys()))
                 p_del_id = prod_map[p_del_label]
-                if st.button("🗑️ Eliminar Producto Definitivamente", type="secondary"):
+                if st.button("🗑️ Confirmar Eliminación", type="secondary"):
                     conn = get_db_connection()
                     c = conn.cursor()
                     c.execute("DELETE FROM productos_corp WHERE id = %s", (p_del_id,))
@@ -1397,7 +1417,7 @@ elif selected_menu == "🏛️ Balance de Situación Financiera":
             st.success(f"## **TOTAL PASIVO + PATRIMONIO: Q {total_pasivo_patrimonio:,.2f}**")
 
 # ==========================================
-# 16. ESTADO DE RESULTADOS CLASIFICADO CON DESPLIEGUE MENSUAL MATRICIAL
+# 16. ESTADO DE RESULTADOS (ESTRUCTURA CONTABLE + MATRIZ MENSUAL ACUMULADA)
 # ==========================================
 elif selected_menu == "📉 Estado de Resultados":
     if not selected_emp_id: st.stop()
@@ -1423,7 +1443,7 @@ elif selected_menu == "📉 Estado de Resultados":
     if modo_er == "🌐 Histórico Acumulado (Mes a Mes)":
         st.markdown(f"""
             <div style="background-color: {color_er}; padding: 10px 18px; border-radius: 8px; color: white; font-weight: bold; margin-bottom: 20px;">
-                📊 Estado de Resultados — Matriz Mensual y Total Acumulado Año Fiscal {anio_er}
+                📊 Estado de Resultados — Matriz Desglosada Mes a Mes y Sumatoria del Año Fiscal {anio_er}
             </div>
         """, unsafe_allow_html=True)
 
@@ -1447,16 +1467,14 @@ elif selected_menu == "📉 Estado de Resultados":
         conn.close()
 
         if df_movs.empty:
-            st.info(f"Sin movimientos en el ejercicio {anio_er}.")
+            st.info(f"Sin movimientos en el ejercicio fiscal {anio_er}.")
         else:
-            # Obtener todas las cuentas con movimiento
             cuentas = df_movs[['codigo', 'nombre', 'tipo']].drop_duplicates().sort_values(by='codigo')
             filas_tabla = []
 
             for _, c_row in cuentas.iterrows():
                 fila = {
-                    "Rubro / Cuenta": f"{c_row['codigo']} - {c_row['nombre']}",
-                    "Tipo": c_row['tipo']
+                    "Estructura Contable": f"{c_row['codigo']} - {c_row['nombre']}"
                 }
                 tot_cta = 0.0
                 for cod_m, nom_m in meses_dict.items():
@@ -1464,15 +1482,13 @@ elif selected_menu == "📉 Estado de Resultados":
                     val = float(sub['monto'].sum()) if not sub.empty else 0.0
                     fila[nom_m] = f"Q {val:,.2f}"
                     tot_cta += val
-                fila["TOTAL ACUMULADO"] = f"Q {tot_cta:,.2f}"
+                fila["TOTAL ACUMULADO ANUAL"] = f"Q {tot_cta:,.2f}"
                 filas_tabla.append(fila)
 
-            # Sumatorias por bloques
             df_matriz_final = pd.DataFrame(filas_tabla)
 
-            # Métricas globales anuales
-            tot_ing = df_movs[df_movs['tipo'] == 'Ingreso']['monto'].sum()
-            tot_gas = df_movs[df_movs['tipo'] == 'Gasto']['monto'].sum()
+            tot_ing = float(df_movs[df_movs['tipo'] == 'Ingreso']['monto'].sum())
+            tot_gas = float(df_movs[df_movs['tipo'] == 'Gasto']['monto'].sum())
             util_ant = round(tot_ing - tot_gas, 2)
             imp_calc, gan_neta, desc_imp = calcular_impuesto_renta(selected_empresa_info[3], tot_ing, util_ant)
 
@@ -1483,8 +1499,8 @@ elif selected_menu == "📉 Estado de Resultados":
             m4.metric("Ganancia Neta Desp. Impuestos", f"Q {gan_neta:,.2f}", delta=f"{'Ganancia ✅' if gan_neta >= 0 else 'Pérdida ⚠️'}")
 
             st.markdown("---")
-            st.markdown("### 📑 Estructura Detallada de Cuentas (Enero a Diciembre)")
-            st.dataframe(df_matriz_final.drop(columns=['Tipo']), use_container_width=True)
+            st.markdown("### 📑 Estructura Detallada (Enero a Diciembre y Total Acumulado)")
+            st.dataframe(df_matriz_final, use_container_width=True)
 
     else:
         cond_er = "d.empresa_id = %s"
@@ -1527,7 +1543,7 @@ elif selected_menu == "📉 Estado de Resultados":
 
         tot_i = float(df_i['monto'].sum()) if not df_i.empty else 0.0
         
-        # Desglose formal contable: Costo de Ventas vs Gastos de Operación
+        # Clasificación contable formal
         df_costos = df_g[df_g['codigo'].str.startswith('5.1.01')]
         df_gastos_op = df_g[~df_g['codigo'].str.startswith('5.1.01')]
 
@@ -1546,7 +1562,7 @@ elif selected_menu == "📉 Estado de Resultados":
         m4.metric("Ganancia Neta Desp. Impuestos", f"Q {ganancia_neta:,.2f}", delta=f"{'Ganancia ✅' if ganancia_neta >= 0 else 'Pérdida ⚠️'}")
 
         st.markdown("---")
-        st.subheader("📑 Estructura Contable Clasificada")
+        st.subheader("📑 Estructura Contable Formal Clasificada")
         st.markdown(f"#### **1. (+) INGRESOS OPERACIONALES: Q {tot_i:,.2f}**")
         for _, r in df_i.iterrows():
             st.write(f"• **{r['codigo']} - {r['nombre']}**: Q {r['monto']:,.2f}")
