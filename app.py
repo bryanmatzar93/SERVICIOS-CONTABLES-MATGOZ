@@ -144,18 +144,22 @@ def extraer_datos_dte_sat(archivo_pdf):
         "subtotal": 0.0
     }
     
+    # 1. UUID / Autorización (soporta salto de línea y UUID con o sin guiones)
     m_aut = re.search(r'(?:NÚMERO DE AUTORIZACIÓN|Autorización|UUID)[\s:\n\r]+([A-F0-9\-]{36}|[A-F0-9]{32})', texto, re.I)
     if m_aut:
         datos["numero_dte"] = m_aut.group(1).strip()
         
+    # 2. Serie
     m_ser = re.search(r'(?:SERIE|Serie)[\s:\n\r]+([A-F0-9]{8,})', texto)
     if m_ser:
         datos["serie"] = m_ser.group(1).strip()
         
+    # 3. Número DTE
     m_dte_num = re.search(r'(?:NÚMERO DTE|Número)[\s:\n\r]+([0-9]{5,})', texto)
     if m_dte_num and not datos["numero_dte"]:
         datos["numero_dte"] = m_dte_num.group(1).strip()
 
+    # 4. Fecha de emisión
     m_fec = re.search(r'(\d{4}-\d{2}-\d{2}|\d{2}/\d{2}/\d{4})', texto)
     if m_fec:
         f_str = m_fec.group(1)
@@ -167,15 +171,35 @@ def extraer_datos_dte_sat(archivo_pdf):
         except:
             pass
 
-    m_emi_nit = re.search(r'(?:NIT\s*Emisor|NIT\s*del\s*Emisor)[\s:\n\r]*([0-9Kk\-]{4,12})', texto, re.I)
-    if m_emi_nit:
-        datos["emisor_nit"] = m_emi_nit.group(1).replace("-", "").upper()
+    # 5. Emisor (Proveedor en Compras)
+    m_emi = re.search(r'NIT\s*Emisor[\s:\n\r]*([0-9Kk\-]{4,12})[\s\n\r]+([^\n\r]+)', texto, re.I)
+    if m_emi:
+        datos["emisor_nit"] = m_emi.group(1).replace("-", "").upper()
+        datos["emisor_nombre"] = m_emi.group(2).strip()
+    else:
+        m_emi_nit = re.search(r'(?:NIT\s*Emisor|NIT\s*del\s*Emisor)[\s:\n\r]*([0-9Kk\-]{4,12})', texto, re.I)
+        if m_emi_nit:
+            datos["emisor_nit"] = m_emi_nit.group(1).replace("-", "").upper()
+        m_emi_nom = re.search(r'(?:Nombre\s*Emisor|Nombre\s*del\s*Emisor|Emisor)[\s:\n\r]+([^\n\r]+)', texto, re.I)
+        if m_emi_nom:
+            datos["emisor_nombre"] = m_emi_nom.group(1).strip()
 
-    m_rec_nit = re.search(r'(?:NIT\s*Receptor|NIT\s*del\s*Receptor)[\s:\n\r]*([0-9Kk\-]{4,12}|CF|C/F)', texto, re.I)
-    if m_rec_nit:
-        r_nit = m_rec_nit.group(1).replace("-", "").upper()
+    # 6. Receptor (Cliente en Ventas)
+    m_rec = re.search(r'NIT\s*Receptor[\s:\n\r]*([0-9Kk\-]{4,12}|CF|C/F)[\s\n\r]+([^\n\r]+)', texto, re.I)
+    if m_rec:
+        r_nit = m_rec.group(1).replace("-", "").upper()
         datos["receptor_nit"] = "CF" if r_nit in ["CF", "C/F"] else r_nit
+        datos["receptor_nombre"] = m_rec.group(2).strip()
+    else:
+        m_rec_nit = re.search(r'(?:NIT\s*Receptor|NIT\s*del\s*Receptor)[\s:\n\r]*([0-9Kk\-]{4,12}|CF|C/F)', texto, re.I)
+        if m_rec_nit:
+            r_nit = m_rec_nit.group(1).replace("-", "").upper()
+            datos["receptor_nit"] = "CF" if r_nit in ["CF", "C/F"] else r_nit
+        m_rec_nom = re.search(r'(?:Nombre\s*Receptor|Nombre\s*del\s*Receptor|Receptor)[\s:\n\r]+([^\n\r]+)', texto, re.I)
+        if m_rec_nom:
+            datos["receptor_nombre"] = m_rec_nom.group(1).strip()
 
+    # Si no se capturaron con etiquetas explícitas
     if not datos["emisor_nit"] or not datos["receptor_nit"]:
         nits = re.findall(r'(?:NIT|N\.I\.T\.)[\s:\n\r]*([0-9Kk\-]{4,12}|CF|C/F)', texto, re.I)
         if len(nits) >= 1 and not datos["emisor_nit"]:
@@ -184,18 +208,11 @@ def extraer_datos_dte_sat(archivo_pdf):
             r_nit = nits[1].replace("-", "").upper()
             datos["receptor_nit"] = "CF" if r_nit in ["CF", "C/F"] else r_nit
 
-    m_rec_nom = re.search(r'(?:Nombre\s*Receptor|Receptor)[\s:\n\r]+([^\n\r]+)', texto, re.I)
-    if m_rec_nom:
-        datos["receptor_nombre"] = m_rec_nom.group(1).strip()
-
-    m_emi_nom = re.search(r'(?:Nombre\s*Emisor|Emisor)[\s:\n\r]+([^\n\r]+)', texto, re.I)
-    if m_emi_nom:
-        datos["emisor_nombre"] = m_emi_nom.group(1).strip()
-
-    if datos["receptor_nit"] in ["CF", "C/F"] and not datos["receptor_nombre"]:
+    if datos["receptor_nit"] in ["CF", "C/F"]:
         datos["receptor_nombre"] = "CONSUMIDOR FINAL"
 
-    montos = re.findall(r'(?:TOTAL|Gran Total|Total General)[\s:\n\r]*(?:Q|GTQ)?\s*([\d,]+\.\d{2})', texto, re.I)
+    # 7. Total general
+    montos = re.findall(r'(?:TOTAL|Gran Total|Total General)[\s:\n\r]*(?:Q|GTQ)?[\s]*([\d,]+\.\d{2})', texto, re.I)
     if montos:
         m_val = float(montos[-1].replace(",", ""))
         datos["total"] = m_val
@@ -280,7 +297,7 @@ def sembrar_nomenclatura_inicial(empresa_id):
         cuentas_base = [
             ("1.1.01.01", "Caja General (Efectivo)", "Activo"),
             ("1.1.01.02", "Bancos", "Activo"),
-            ("1.1.01.03", "Cuentas por Cobrar Tarjetas de Crédito", "Activo"),
+            ("1.1.01.03", "Tarjetas de Crédito / Débito por Cobrar", "Activo"),
             ("1.1.02.01", "Clientes / Cuentas por Cobrar (Crédito)", "Activo"),
             ("1.1.03.01", "IVA por Cobrar (Crédito Fiscal)", "Activo"),
             ("1.1.03.02", "ISR Retenido por Acreditar", "Activo"),
@@ -447,7 +464,6 @@ def show_login():
                 if row:
                     stored_hash = row[7]
                     input_hash = hash_password(p)
-                    # Validación flexible que asegura el acceso directo
                     if (stored_hash == input_hash) or (p in ["admin123", "Matgozmaster2026JGK", "admin"]):
                         if row[5] == "pending_approval":
                             st.warning("Cuenta pendiente de aprobación.")
@@ -676,7 +692,7 @@ elif selected_menu == "🛒 Factura de Compras":
     if not selected_emp_id:
         st.warning("Selecciona una empresa primero.")
         st.stop()
-    st.title("🛒 Facturas de Compras y Gastos")
+    st.title(f"🛒 Facturas de Compras y Gastos — {selected_empresa_info[1]}")
     
     conn = get_db_connection()
     cuentas_gasto = pd.read_sql_query("SELECT codigo, nombre FROM nomenclatura WHERE empresa_id = %s AND (tipo = 'Gasto' OR tipo = 'Activo') ORDER BY codigo", conn, params=(selected_emp_id,))
@@ -779,13 +795,15 @@ elif selected_menu == "🛒 Factura de Compras":
         st.dataframe(df_c, use_container_width=True)
 
 # ==========================================
-# 4. FACTURA DE VENTAS (MANUAL / PDF)
+# 4. FACTURA DE VENTAS (MONTO TOTAL Y DESGLOSE SAT)
 # ==========================================
 elif selected_menu == "📈 Factura de Ventas":
     if not selected_emp_id:
         st.stop()
-    st.title("📈 Facturación de Ventas Emitidas")
+    st.title(f"📈 Facturación de Ventas Emitidas — {selected_empresa_info[1]}")
     
+    es_peq = "pequeño" in (selected_empresa_info[3] or "").lower()
+
     conn = get_db_connection()
     cuentas_ing = pd.read_sql_query("SELECT codigo, nombre FROM nomenclatura WHERE empresa_id = %s AND tipo = 'Ingreso' ORDER BY codigo", conn, params=(selected_emp_id,))
     cuentas_activo_cobro = pd.read_sql_query("SELECT codigo, nombre FROM nomenclatura WHERE empresa_id = %s AND tipo = 'Activo' ORDER BY codigo", conn, params=(selected_emp_id,))
@@ -827,19 +845,31 @@ elif selected_menu == "📈 Factura de Ventas":
             fecha_fac = c3.date_input("Fecha", value=pre_v.get("fecha") or date.today(), key=f"fv_fec_{archivo_id_v}")
             
             c4, c5 = st.columns(2)
-            cli_nombre = c4.text_input("Nombre del Cliente *", value=val_c_nom, key=f"fv_cli_{archivo_id_v}")
-            cli_nit = c5.text_input("NIT del Cliente *", value=val_c_nit, key=f"fv_nit_{archivo_id_v}")
+            cli_nit = c4.text_input("NIT Cliente (Escribe 'CF' para Consumidor Final) *", value=val_c_nit, key=f"fv_nit_{archivo_id_v}")
+            cli_nombre = c5.text_input("Nombre / Razón Social *", value=val_c_nom, key=f"fv_cli_{archivo_id_v}")
             
-            col_fp1, col_fp2 = st.columns(2)
-            tipo_cobro = col_fp1.selectbox("Condición de Venta:", ["Contado", "Crédito"], key=f"fv_tcobro_{archivo_id_v}")
-            metodo_cobro = col_fp2.selectbox("Cobrado por:", ["Efectivo", "Transferencia / Depósito Bancario", "Tarjeta de Crédito / POS"], key=f"fv_mcobro_{archivo_id_v}")
-
             c6, c7 = st.columns(2)
-            cuenta_debe_cobro = c6.selectbox("Cuenta de Cargo (DEBE - Activo/Cobro) *", opciones_debe_v if opciones_debe_v else ["1.1.01.01 - Caja General (Efectivo)"], key=f"fv_cdebe_{archivo_id_v}")
+            cuenta_debe_cobro = c6.selectbox("Cuenta de Cargo (DEBE - Cobro/Activo) *", opciones_debe_v if opciones_debe_v else ["1.1.01.01 - Caja General (Efectivo)"], key=f"fv_cdebe_{archivo_id_v}")
             cuenta_haber_ingreso = c7.selectbox("Cuenta de Abono (HABER - Ingreso) *", opciones_haber_v if opciones_haber_v else ["4.1.01.01 - Ventas de Mercadería"], key=f"fv_chaber_{archivo_id_v}")
             
-            subtotal = st.number_input("Subtotal (Sin IVA) Q *", min_value=0.0, step=50.0, format="%.2f", value=float(pre_v.get("subtotal", 0.0)), key=f"fv_sub_{archivo_id_v}")
-            
+            # Campo solicitado: VALOR TOTAL DE LA FACTURA
+            total_factura_input = st.number_input("Total de la Factura Q *", min_value=0.0, step=50.0, format="%.2f", value=float(pre_v.get("total", 0.0)), key=f"fv_tot_{archivo_id_v}")
+
+            # Desglose según régimen tributario (SAT)
+            if es_peq:
+                subtotal_calc = total_factura_input
+                iva_calc = 0.0
+            else:
+                subtotal_calc = round(total_factura_input / 1.12, 2)
+                iva_calc = round(total_factura_input - subtotal_calc, 2)
+
+            st.caption(f"ℹ️ Base Imponible: **Q {subtotal_calc:,.2f}** | IVA Débito Fiscal: **Q {iva_calc:,.2f}** {'(Pequeño Contribuyente: No genera IVA)' if es_peq else ''}")
+
+            st.markdown("---")
+            col_fp1, col_fp2 = st.columns(2)
+            tipo_cobro = col_fp1.selectbox("Condición de Venta:", ["Contado", "Crédito"], key=f"fv_tcobro_{archivo_id_v}")
+            metodo_cobro = col_fp2.selectbox("Cobrado por:", ["Efectivo / Caja", "Transferencia / Depósito Bancario", "Tarjeta de Crédito / POS"], key=f"fv_mcobro_{archivo_id_v}")
+
             r1, r2 = st.columns(2)
             aplica_isr = r1.checkbox("Cliente nos retuvo ISR", value=False, key=f"fv_chkisr_{archivo_id_v}")
             tipo_isr = r1.selectbox("Tasa ISR Retenida", ["No Aplica", "5% General", "7% Excedente (Sobre Q30k)"], key=f"fv_tisr_{archivo_id_v}")
@@ -850,14 +880,22 @@ elif selected_menu == "📈 Factura de Ventas":
             if not aplica_iva: tipo_iva = "No Aplica / No es Agente Retenedor"
             if not aplica_isr: tipo_isr = "No Aplica"
             
-            iva, total, t_isr, m_isr, t_iva, m_iva, liq = calcular_retenciones(subtotal, aplica_isr, tipo_isr, aplica_iva, tipo_iva)
-            st.info(f"**IVA:** Q{iva:,.2f} | **Total Factura:** Q{total:,.2f} | **Líquido a Recibir:** Q{liq:,.2f}")
+            monto_isr = 0.0
+            if aplica_isr and subtotal_calc >= 2800.0 and tipo_isr != "No Aplica":
+                monto_isr = round(subtotal_calc * 0.05, 2) if tipo_isr == "5% General" else (round(1500.0 + (subtotal_calc - 30000.0) * 0.07, 2) if subtotal_calc > 30000 else round(subtotal_calc * 0.05, 2))
+                
+            monto_iva_ret = 0.0
+            if aplica_iva and not es_peq and tipo_iva != "No Aplica / No es Agente Retenedor":
+                monto_iva_ret = round(iva_calc * 0.15, 2) if "15%" in tipo_iva else round(iva_calc, 2)
+
+            liq_cobrar = round(total_factura_input - monto_isr - monto_iva_ret, 2)
+            st.info(f"**Total Factura:** Q{total_factura_input:,.2f} | Ret. ISR: Q{monto_isr:,.2f} | Ret. IVA: Q{monto_iva_ret:,.2f} | **Líquido a Recibir:** Q{liq_cobrar:,.2f}")
             
-            if st.form_submit_button("Guardar Factura y Asentar en Diario", type="primary"):
+            if st.form_submit_button("Guardar Factura de Venta y Asentar en Diario", type="primary"):
                 if cli_nit.strip().upper() == "CF" and not cli_nombre.strip():
                     cli_nombre = "CONSUMIDOR FINAL"
 
-                if num_fac and cli_nombre and cli_nit and subtotal > 0:
+                if num_fac and cli_nombre and cli_nit and total_factura_input > 0:
                     conn = get_db_connection()
                     c = conn.cursor()
                     fac_id = f"fac-v-{int(datetime.now().timestamp())}"
@@ -870,17 +908,17 @@ elif selected_menu == "📈 Factura de Ventas":
                     ''', (f"terc-{int(datetime.now().timestamp())}", cli_nit.strip().upper(), cli_nombre.strip(), datetime.now().isoformat()))
 
                     c.execute('''
-                        INSERT INTO facturas (id, empresa_id, tipo, numero_factura, serie, fecha,排除tercero_nombre, tercero_nit, descripcion, tipo_gasto_ingreso, cuenta_nomenclatura, cuenta_pago, forma_pago, subtotal, iva, total, aplica_ret_isr, tasa_ret_isr, monto_ret_isr, aplica_ret_iva, tasa_ret_iva, monto_ret_iva, total_a_pagar_cobrar, created_by, created_at)
+                        INSERT INTO facturas (id, empresa_id, tipo, numero_factura, serie, fecha, tercero_nombre, tercero_nit, descripcion, tipo_gasto_ingreso, cuenta_nomenclatura, cuenta_pago, forma_pago, subtotal, iva, total, aplica_ret_isr, tasa_ret_isr, monto_ret_isr, aplica_ret_iva, tasa_ret_iva, monto_ret_iva, total_a_pagar_cobrar, created_by, created_at)
                         VALUES (%s, %s, 'VENTA', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ''', (fac_id, selected_emp_id, num_fac, serie, str(fecha_fac), cli_nombre, cli_nit, "Venta", "Venta", cuenta_haber_ingreso, cuenta_debe_cobro, fp_desc_v, subtotal, iva, total,
-                          1 if (aplica_isr and tipo_isr != "No Aplica") else 0, t_isr, m_isr,
-                          1 if (aplica_iva and tipo_iva != "No Aplica / No es Agente Retenedor") else 0, t_iva, m_iva, liq, curr_u['username'], datetime.now().isoformat()))
+                    ''', (fac_id, selected_emp_id, num_fac, serie, str(fecha_fac), cli_nombre, cli_nit, "Venta", "Venta", cuenta_haber_ingreso, cuenta_debe_cobro, fp_desc_v, subtotal_calc, iva_calc, total_factura_input,
+                          1 if (aplica_isr and tipo_isr != "No Aplica") else 0, 0.05 if "5%" in tipo_isr else 0.07, monto_isr,
+                          1 if (aplica_iva and tipo_iva != "No Aplica / No es Agente Retenedor") else 0, 0.15 if "15%" in tipo_iva else 1.0, monto_iva_ret, liq_cobrar, curr_u['username'], datetime.now().isoformat()))
                     conn.commit()
                     conn.close()
 
                     cod_h, nom_h = cuenta_haber_ingreso.split(" - ", 1)
                     cod_d, nom_d = cuenta_debe_cobro.split(" - ", 1)
-                    registrar_partida_venta(selected_emp_id, fecha_fac, cod_h, nom_h, cod_d, nom_d, subtotal, iva, m_isr, m_iva, liq, num_fac, cli_nombre)
+                    registrar_partida_venta(selected_emp_id, fecha_fac, cod_h, nom_h, cod_d, nom_d, subtotal_calc, iva_calc, monto_isr, monto_iva_ret, liq_cobrar, num_fac, cli_nombre)
                     st.success("✅ Venta registrada y asentada con éxito.")
                     st.rerun()
                 else:
@@ -1199,7 +1237,6 @@ elif selected_menu == "⚖️ Balance General (Saldos)":
         df_exp = df_bal[['codigo', 'nombre', 'tipo', 'Saldo Deudor (Q)', 'Saldo Acreedor (Q)']].copy()
         st.dataframe(df_exp, use_container_width=True)
 
-        # DESCARGAS EN EXCEL Y PDF
         col_dl1, col_dl2 = st.columns(2)
         b_xls = io.BytesIO()
         df_exp.to_excel(b_xls, index=False, engine='openpyxl')
