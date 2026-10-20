@@ -144,7 +144,6 @@ def init_db():
             created_at TEXT
         );
     ''')
-    # Tabla compatible de productos (Corporativa)
     c.execute('''
         CREATE TABLE IF NOT EXISTS productos (
             id SERIAL PRIMARY KEY,
@@ -173,7 +172,6 @@ def init_db():
     ''')
     conn.commit()
 
-    # Usuario admin inicial
     c.execute("SELECT COUNT(*) FROM users WHERE username = 'admin'")
     if c.fetchone()[0] == 0:
         c.execute('''
@@ -459,6 +457,13 @@ with st.sidebar:
         menu_options.extend(["👥 Control de Usuarios (Admin)", "🏢 Gestión de Empresas (Admin)"])
     selected_menu = st.radio("Navegación:", menu_options)
 
+# Meses estándar
+meses_dict = {
+    "01": "Enero", "02": "Febrero", "03": "Marzo", "04": "Abril",
+    "05": "Mayo", "06": "Junio", "07": "Julio", "08": "Agosto",
+    "09": "Septiembre", "10": "Octubre", "11": "Noviembre", "12": "Diciembre"
+}
+
 # ==========================================
 # 1. RESUMEN GENERAL
 # ==========================================
@@ -531,18 +536,12 @@ elif selected_menu == "📅 Desglose Mensual":
     df_raw = pd.read_sql_query(q_mensual, conn, params=(selected_emp_id, anio_sel))
     conn.close()
 
-    meses_nombres = {
-        "01": "Enero", "02": "Febrero", "03": "Marzo", "04": "Abril",
-        "05": "Mayo", "06": "Junio", "07": "Julio", "08": "Agosto",
-        "09": "Septiembre", "10": "Octubre", "11": "Noviembre", "12": "Diciembre"
-    }
-
     filas_meses = []
     tot_anual_ing = 0.0
     tot_anual_gas = 0.0
     tot_anual_util = 0.0
 
-    for cod_m, nombre_m in meses_nombres.items():
+    for cod_m, nombre_m in meses_dict.items():
         sub_df = df_raw[df_raw['mes'] == cod_m] if not df_raw.empty else pd.DataFrame()
         ing = float(sub_df['total_ingresos'].sum()) if not sub_df.empty else 0.0
         gas = float(sub_df['total_gastos'].sum()) if not sub_df.empty else 0.0
@@ -959,15 +958,14 @@ elif selected_menu == "📋 Libro de Ventas (SAT)":
         st.download_button("📥 Descargar Libro de Ventas (CSV)", df_lv.to_csv(index=False).encode('utf-8'), f"ventas_{selected_empresa_info[2]}.csv", "text/csv")
 
 # ==========================================
-# 7. CATÁLOGO CORPORATIVO DE ARTÍCULOS E INVENTARIOS (KÁRDEX CONECTADO A SUPABASE)
+# 7. CATÁLOGO CORPORATIVO DE ARTÍCULOS E INVENTARIOS (KÁRDEX CONECTADO A PRODUCTOS)
 # ==========================================
 elif selected_menu == "📦 Catálogo de Artículos e Inventarios":
     st.title("📦 Catálogo Corporativo de Artículos e Inventarios")
-    st.caption("Base de datos global en Supabase. Los productos están disponibles para todas las empresas de forma compartida.")
+    st.caption("Base de datos corporativa en Supabase. El catálogo es compartido para todas las empresas del sistema.")
 
     conn = get_db_connection()
     c = conn.cursor()
-    # Busca el código numérico más alto en la tabla productos de Supabase
     c.execute("""
         SELECT COALESCE(MAX(NULLIF(regexp_replace(codigo, '[^0-9]', '', 'g'), '')::integer), 0) + 1 
         FROM productos;
@@ -989,13 +987,12 @@ elif selected_menu == "📦 Catálogo de Artículos e Inventarios":
                 conn = get_db_connection()
                 c = conn.cursor()
                 try:
-                    # Inserción en la tabla original 'productos' de Supabase sin restricción de empresa
                     c.execute("""
                         INSERT INTO productos (empresa_id, codigo, descripcion, costo_promedio, precio_venta, existencia, created_at)
                         VALUES ('CORP', %s, %s, %s, %s, 0, %s)
                     """, (str(int(p_correlativo)), p_desc.strip(), p_cost, p_vent, datetime.now().isoformat()))
                     conn.commit()
-                    st.success(f"✅ Producto #{p_correlativo} - '{p_desc}' guardado permanentemente en Supabase a nivel corporativo.")
+                    st.success(f"✅ Producto #{p_correlativo} - '{p_desc}' guardado permanentemente a nivel corporativo.")
                     st.rerun()
                 except Exception as ex:
                     conn.rollback()
@@ -1009,7 +1006,6 @@ elif selected_menu == "📦 Catálogo de Artículos e Inventarios":
     st.subheader("Artículos Catalogados en el Sistema Corporativo")
 
     conn = get_db_connection()
-    # Consulta unificada sin filtro de empresa_id para que sea 100% corporativo
     df_prods = pd.read_sql_query("""
         SELECT id, codigo AS "Código", descripcion AS "Descripción",
                costo_promedio AS "Costo Ref. (Q)", precio_venta AS "Precio Venta (Q)",
@@ -1025,7 +1021,7 @@ elif selected_menu == "📦 Catálogo de Artículos e Inventarios":
         if is_admin:
             with st.expander("🔒 Eliminar Producto (Exclusivo Administrador)", expanded=False):
                 prod_map = {f"#{r['Código']} - {r['Descripción']}": r['id'] for _, r in df_prods.iterrows()}
-                p_del_label = st.selectbox("Seleccionar producto para eliminar:", list(prod_map.keys()))
+                p_del_label = st.selectbox("Seleccionar producto para dar de baja:", list(prod_map.keys()))
                 p_del_id = prod_map[p_del_label]
                 if st.button("🗑️ Confirmar Eliminación", type="secondary"):
                     conn = get_db_connection()
@@ -1188,7 +1184,7 @@ elif selected_menu == "📚 Libro Mayor":
         st.dataframe(df_m, use_container_width=True)
 
 # ==========================================
-# 14. BALANCE GENERAL DE SALDOS
+# 14. BALANCE GENERAL DE SALDOS (CON ESTRUCTURA CONTABLE Y MATRIZ MENSUAL)
 # ==========================================
 elif selected_menu == "⚖️ Balance General (Saldos)":
     if not selected_emp_id: st.stop()
@@ -1200,65 +1196,143 @@ elif selected_menu == "⚖️ Balance General (Saldos)":
     conn.close()
     anios_list = df_anios['anio'].dropna().tolist() if not df_anios.empty else [str(datetime.now().year)]
 
-    c_f1, c_f2, c_f3 = st.columns([2, 1.5, 1])
-    modo_vista = c_f1.radio("Visualizar Saldo por:", ["📆 Por Año Completo", "📅 Por Mes", "🌐 Saldo Acumulado Histórico"], horizontal=True, key="bsal_modo")
+    c_f1, c_f2, c_f3 = st.columns([2.5, 1.5, 1])
+    modo_vista = c_f1.radio("Visualizar Saldo por:", ["🌐 Saldo Acumulado Histórico (Mes a Mes)", "📆 Por Año Completo", "📅 Por Mes"], horizontal=True, key="bsal_modo")
     anio_sel = c_f2.selectbox("Año Fiscal:", anios_list, key="bsal_anio")
     color_filtro = c_f3.color_picker("Color de filtro:", value="#1E3A8A", key="bsal_color")
 
-    cond_sql = "n.empresa_id = %s"
-    sql_params = [selected_emp_id]
-    etiqueta = "Histórico Acumulado Completo"
+    if modo_vista == "🌐 Saldo Acumulado Histórico (Mes a Mes)":
+        st.markdown(f"""
+            <div style="background-color: {color_filtro}; padding: 10px 18px; border-radius: 8px; color: white; font-weight: bold; margin-bottom: 20px;">
+                ⚖️ Balance General de Saldos — Estructura Formal Desglosada Mes a Mes ({anio_sel})
+            </div>
+        """, unsafe_allow_html=True)
 
-    if modo_vista == "📆 Por Año Completo":
-        cond_sql += " AND SUBSTRING(d.fecha FROM 1 FOR 4) = %s"
-        sql_params.append(anio_sel)
-        etiqueta = f"Año Fiscal {anio_sel}"
-    elif modo_vista == "📅 Por Mes":
-        meses_d = {"01":"Enero","02":"Febrero","03":"Marzo","04":"Abril","05":"Mayo","06":"Junio","07":"Julio","08":"Agosto","09":"Septiembre","10":"Octubre","11":"Noviembre","12":"Diciembre"}
-        mes_sel = st.selectbox("Mes:", list(meses_d.keys()), format_func=lambda x: f"{x} - {meses_d[x]}", key="bsal_mes")
-        cond_sql += " AND SUBSTRING(d.fecha FROM 1 FOR 4) = %s AND SUBSTRING(d.fecha FROM 6 FOR 2) = %s"
-        sql_params.extend([anio_sel, mes_sel])
-        etiqueta = f"{meses_d[mes_sel]} {anio_sel}"
+        conn = get_db_connection()
+        q_bal_matriz = """
+            SELECT n.codigo, n.nombre, n.tipo,
+                   SUBSTRING(d.fecha FROM 6 FOR 2) AS mes,
+                   COALESCE(SUM(d.debe), 0) AS total_debe,
+                   COALESCE(SUM(d.haber), 0) AS total_haber
+            FROM nomenclatura n
+            JOIN libro_diario d ON n.codigo = d.codigo_cuenta AND d.empresa_id = n.empresa_id
+            WHERE d.empresa_id = %s AND SUBSTRING(d.fecha FROM 1 FOR 4) = %s
+            GROUP BY n.codigo, n.nombre, n.tipo, SUBSTRING(d.fecha FROM 6 FOR 2)
+            ORDER BY n.codigo ASC
+        """
+        df_raw_bs = pd.read_sql_query(q_bal_matriz, conn, params=(selected_emp_id, anio_sel))
+        conn.close()
 
-    st.markdown(f"""
-        <div style="background-color: {color_filtro}; padding: 10px 16px; border-radius: 8px; color: white; font-weight: bold; margin-bottom: 15px;">
-            📌 Período Consultado: {etiqueta}
-        </div>
-    """, unsafe_allow_html=True)
+        if df_raw_bs.empty:
+            st.info(f"Sin movimientos contables registrados en el año {anio_sel}.")
+        else:
+            grupos = [
+                ("1. CUENTAS DE ACTIVO", df_raw_bs[df_raw_bs['tipo'] == 'Activo']),
+                ("2. CUENTAS DE PASIVO", df_raw_bs[df_raw_bs['tipo'] == 'Pasivo']),
+                ("3. CUENTAS DE CAPITAL / PATRIMONIO", df_raw_bs[df_raw_bs['tipo'] == 'Capital']),
+                ("4. CUENTAS DE RESULTADOS (INGRESOS)", df_raw_bs[df_raw_bs['tipo'] == 'Ingreso']),
+                ("5. CUENTAS DE RESULTADOS (GASTOS)", df_raw_bs[df_raw_bs['tipo'] == 'Gasto'])
+            ]
 
-    conn = get_db_connection()
-    query_b = f"""
-        SELECT n.codigo, n.nombre, n.tipo,
-               COALESCE(SUM(d.debe), 0) AS total_debe,
-               COALESCE(SUM(d.haber), 0) AS total_haber
-        FROM nomenclatura n
-        LEFT JOIN libro_diario d ON n.codigo = d.codigo_cuenta AND d.empresa_id = n.empresa_id
-        WHERE {cond_sql}
-        GROUP BY n.codigo, n.nombre, n.tipo
-        HAVING COALESCE(SUM(d.debe), 0) > 0 OR COALESCE(SUM(d.haber), 0) > 0
-        ORDER BY n.codigo ASC
-    """
-    df_bal = pd.read_sql_query(query_b, conn, params=tuple(sql_params))
-    conn.close()
+            filas_bs = []
+            sum_deudor_mes = {k: 0.0 for k in meses_dict.keys()}
+            sum_acreedor_mes = {k: 0.0 for k in meses_dict.keys()}
 
-    if df_bal.empty:
-        st.info("Sin registros en el período.")
+            for grp_nombre, grp_df in grupos:
+                if grp_df.empty:
+                    continue
+                filas_bs.append({"Estructura Contable": f"📁 {grp_nombre}", **{m: "" for m in meses_dict.values()}, "TOTAL ACUMULADO ANUAL": ""})
+                cuentas_grp = grp_df[['codigo', 'nombre', 'tipo']].drop_duplicates().sort_values(by='codigo')
+
+                for _, cr in cuentas_grp.iterrows():
+                    fila_c = {"Estructura Contable": f"  • {cr['codigo']} - {cr['nombre']}"}
+                    cta_tot = 0.0
+                    for cod_m, nom_m in meses_dict.items():
+                        m_sub = grp_df[(grp_df['codigo'] == cr['codigo']) & (grp_df['mes'] == cod_m)]
+                        d = float(m_sub['total_debe'].sum()) if not m_sub.empty else 0.0
+                        h = float(m_sub['total_haber'].sum()) if not m_sub.empty else 0.0
+                        saldo_neto = (d - h) if cr['tipo'] in ['Activo', 'Gasto'] else (h - d)
+                        fila_c[nom_m] = f"Q {saldo_neto:,.2f}"
+                        cta_tot += saldo_neto
+                        if cr['tipo'] in ['Activo', 'Gasto']:
+                            sum_deudor_mes[cod_m] += max(0, d - h)
+                            sum_acreedor_mes[cod_m] += max(0, h - d)
+                        else:
+                            sum_acreedor_mes[cod_m] += max(0, h - d)
+                            sum_deudor_mes[cod_m] += max(0, d - h)
+                    fila_c["TOTAL ACUMULADO ANUAL"] = f"Q {cta_tot:,.2f}"
+                    filas_bs.append(fila_c)
+
+            # Filas de Totales y Cuadratura
+            fila_deud = {"Estructura Contable": "(=) SUMA DEUDORA TOTAL"}
+            for cod_m, nom_m in meses_dict.items():
+                fila_deud[nom_m] = f"Q {sum_deudor_mes[cod_m]:,.2f}"
+            fila_deud["TOTAL ACUMULADO ANUAL"] = f"Q {sum(sum_deudor_mes.values()):,.2f}"
+            filas_bs.append(fila_deud)
+
+            fila_acred = {"Estructura Contable": "(=) SUMA ACREEDORA TOTAL"}
+            for cod_m, nom_m in meses_dict.items():
+                fila_acred[nom_m] = f"Q {sum_acreedor_mes[cod_m]:,.2f}"
+            fila_acred["TOTAL ACUMULADO ANUAL"] = f"Q {sum(sum_acreedor_mes.values()):,.2f}"
+            filas_bs.append(fila_acred)
+
+            df_matriz_bs = pd.DataFrame(filas_bs)
+            st.dataframe(df_matriz_bs, use_container_width=True)
+
     else:
-        df_bal['Saldo Deudor (Q)'] = df_bal.apply(lambda r: round(float(r['total_debe'] - r['total_haber']), 2) if r['total_debe'] > r['total_haber'] else 0.0, axis=1)
-        df_bal['Saldo Acreedor (Q)'] = df_bal.apply(lambda r: round(float(r['total_haber'] - r['total_debe']), 2) if r['total_haber'] > r['total_debe'] else 0.0, axis=1)
+        cond_sql = "n.empresa_id = %s"
+        sql_params = [selected_emp_id]
+        etiqueta = "Histórico Acumulado Completo"
 
-        c1, c2, c3 = st.columns(3)
-        sd = df_bal['Saldo Deudor (Q)'].sum()
-        sa = df_bal['Saldo Acreedor (Q)'].sum()
-        dif = round(sd - sa, 2)
-        c1.metric("Suma Deudora", f"Q {sd:,.2f}")
-        c2.metric("Suma Acreedora", f"Q {sa:,.2f}")
-        c3.metric("Diferencia", f"Q {dif:,.2f}", delta="Cuadrado ✅" if abs(dif) < 0.01 else "Descuadre ⚠️")
+        if modo_vista == "📆 Por Año Completo":
+            cond_sql += " AND SUBSTRING(d.fecha FROM 1 FOR 4) = %s"
+            sql_params.append(anio_sel)
+            etiqueta = f"Año Fiscal {anio_sel}"
+        elif modo_vista == "📅 Por Mes":
+            mes_sel = st.selectbox("Mes:", list(meses_dict.keys()), format_func=lambda x: f"{x} - {meses_dict[x]}", key="bsal_mes")
+            cond_sql += " AND SUBSTRING(d.fecha FROM 1 FOR 4) = %s AND SUBSTRING(d.fecha FROM 6 FOR 2) = %s"
+            sql_params.extend([anio_sel, mes_sel])
+            etiqueta = f"{meses_dict[mes_sel]} {anio_sel}"
 
-        st.dataframe(df_bal[['codigo', 'nombre', 'tipo', 'Saldo Deudor (Q)', 'Saldo Acreedor (Q)']], use_container_width=True)
+        st.markdown(f"""
+            <div style="background-color: {color_filtro}; padding: 10px 16px; border-radius: 8px; color: white; font-weight: bold; margin-bottom: 15px;">
+                📌 Período Consultado: {etiqueta}
+            </div>
+        """, unsafe_allow_html=True)
+
+        conn = get_db_connection()
+        query_b = f"""
+            SELECT n.codigo, n.nombre, n.tipo,
+                   COALESCE(SUM(d.debe), 0) AS total_debe,
+                   COALESCE(SUM(d.haber), 0) AS total_haber
+            FROM nomenclatura n
+            LEFT JOIN libro_diario d ON n.codigo = d.codigo_cuenta AND d.empresa_id = n.empresa_id
+            WHERE {cond_sql}
+            GROUP BY n.codigo, n.nombre, n.tipo
+            HAVING COALESCE(SUM(d.debe), 0) > 0 OR COALESCE(SUM(d.haber), 0) > 0
+            ORDER BY n.codigo ASC
+        """
+        df_bal = pd.read_sql_query(query_b, conn, params=tuple(sql_params))
+        conn.close()
+
+        if df_bal.empty:
+            st.info("Sin registros en el período.")
+        else:
+            df_bal['Saldo Deudor (Q)'] = df_bal.apply(lambda r: round(float(r['total_debe'] - r['total_haber']), 2) if r['total_debe'] > r['total_haber'] else 0.0, axis=1)
+            df_bal['Saldo Acreedor (Q)'] = df_bal.apply(lambda r: round(float(r['total_haber'] - r['total_debe']), 2) if r['total_haber'] > r['total_debe'] else 0.0, axis=1)
+
+            c1, c2, c3 = st.columns(3)
+            sd = df_bal['Saldo Deudor (Q)'].sum()
+            sa = df_bal['Saldo Acreedor (Q)'].sum()
+            dif = round(sd - sa, 2)
+            c1.metric("Suma Deudora", f"Q {sd:,.2f}")
+            c2.metric("Suma Acreedora", f"Q {sa:,.2f}")
+            c3.metric("Diferencia", f"Q {dif:,.2f}", delta="Cuadrado ✅" if abs(dif) < 0.01 else "Descuadre ⚠️")
+
+            st.dataframe(df_bal[['codigo', 'nombre', 'tipo', 'Saldo Deudor (Q)', 'Saldo Acreedor (Q)']], use_container_width=True)
 
 # ==========================================
-# 15. BALANCE DE SITUACIÓN FINANCIERA
+# 15. BALANCE DE SITUACIÓN FINANCIERA (CON ESTRUCTURA CONTABLE Y MATRIZ MENSUAL)
 # ==========================================
 elif selected_menu == "🏛️ Balance de Situación Financiera":
     if not selected_emp_id: st.stop()
@@ -1270,125 +1344,270 @@ elif selected_menu == "🏛️ Balance de Situación Financiera":
     conn.close()
     anios_list = df_anios['anio'].dropna().tolist() if not df_anios.empty else [str(datetime.now().year)]
 
-    col_btn1, col_btn2, col_btn3 = st.columns([2, 1.5, 1])
-    modo_sit = col_btn1.radio("Visualizar por:", ["📆 Por Año", "📅 Por Mes", "🌐 Saldo Acumulado"], horizontal=True, key="sit_modo")
+    col_btn1, col_btn2, col_btn3 = st.columns([2.5, 1.5, 1])
+    modo_sit = col_btn1.radio("Visualizar por:", ["🌐 Saldo Acumulado (Mes a Mes)", "📆 Por Año", "📅 Por Mes"], horizontal=True, key="sit_modo")
     anio_sel_sit = col_btn2.selectbox("Año Fiscal:", anios_list, key="sit_anio")
     color_sit = col_btn3.color_picker("Color del Año:", value="#1E3A8A", key="sit_color")
 
-    cond_sit = "d.empresa_id = %s"
-    params_sit = [selected_emp_id]
-    tit_sit = f"Acumulado Histórico al {date.today()}"
+    if modo_sit == "🌐 Saldo Acumulado (Mes a Mes)":
+        st.markdown(f"""
+            <div style="background-color: {color_sit}; padding: 10px 18px; border-radius: 8px; color: white; font-weight: bold; margin-bottom: 18px;">
+                🏛️ Estado de Situación Financiera — Matriz Completa Clasificada ({anio_sel_sit})
+            </div>
+        """, unsafe_allow_html=True)
 
-    if modo_sit == "📆 Por Año":
-        cond_sit += " AND SUBSTRING(d.fecha FROM 1 FOR 4) = %s"
-        params_sit.append(anio_sel_sit)
-        tit_sit = f"Al cierre del Año Fiscal {anio_sel_sit}"
-    elif modo_sit == "📅 Por Mes":
-        meses_dict = {"01":"Enero","02":"Febrero","03":"Marzo","04":"Abril","05":"Mayo","06":"Junio","07":"Julio","08":"Agosto","09":"Septiembre","10":"Octubre","11":"Noviembre","12":"Diciembre"}
-        mes_sel_sit = st.selectbox("Seleccionar Mes:", list(meses_dict.keys()), format_func=lambda x: f"{x} - {meses_dict[x]}", key="sit_mes")
-        cond_sit += " AND SUBSTRING(d.fecha FROM 1 FOR 4) = %s AND SUBSTRING(d.fecha FROM 6 FOR 2) = %s"
-        params_sit.extend([anio_sel_sit, mes_sel_sit])
-        tit_sit = f"Al cierre de {meses_dict[mes_sel_sit]} de {anio_sel_sit}"
+        conn = get_db_connection()
+        q_raw_sit = """
+            SELECT n.codigo, n.nombre, n.tipo,
+                   SUBSTRING(d.fecha FROM 6 FOR 2) AS mes,
+                   COALESCE(SUM(d.debe), 0) AS total_debe,
+                   COALESCE(SUM(d.haber), 0) AS total_haber
+            FROM nomenclatura n
+            JOIN libro_diario d ON n.codigo = d.codigo_cuenta AND d.empresa_id = n.empresa_id
+            WHERE d.empresa_id = %s AND SUBSTRING(d.fecha FROM 1 FOR 4) = %s
+            GROUP BY n.codigo, n.nombre, n.tipo, SUBSTRING(d.fecha FROM 6 FOR 2)
+            ORDER BY n.codigo ASC
+        """
+        df_sit_raw = pd.read_sql_query(q_raw_sit, conn, params=(selected_emp_id, anio_sel_sit))
+        conn.close()
 
-    st.markdown(f"""
-        <div style="background-color: {color_sit}; padding: 10px 18px; border-radius: 8px; color: white; font-weight: bold; margin-bottom: 18px;">
-            🏛️ Estado de Situación Financiera — {tit_sit}
-        </div>
-    """, unsafe_allow_html=True)
+        if df_sit_raw.empty:
+            st.info(f"Sin registros contables en el año {anio_sel_sit}.")
+        else:
+            act_corr_df = df_sit_raw[(df_sit_raw['tipo'] == 'Activo') & (df_sit_raw['codigo'].str.startswith('1.1'))]
+            act_nocorr_df = df_sit_raw[(df_sit_raw['tipo'] == 'Activo') & (df_sit_raw['codigo'].str.startswith('1.2'))]
+            pas_corr_df = df_sit_raw[(df_sit_raw['tipo'] == 'Pasivo') & (df_sit_raw['codigo'].str.startswith('2.1'))]
+            pas_nocorr_df = df_sit_raw[(df_sit_raw['tipo'] == 'Pasivo') & (df_sit_raw['codigo'].str.startswith('2.2'))]
+            cap_df = df_sit_raw[df_sit_raw['tipo'] == 'Capital']
 
-    conn = get_db_connection()
-    q_cuentas = f"""
-        SELECT n.codigo, n.nombre, n.tipo,
-               COALESCE(SUM(d.debe), 0) AS total_debe,
-               COALESCE(SUM(d.haber), 0) AS total_haber
-        FROM nomenclatura n
-        JOIN libro_diario d ON n.codigo = d.codigo_cuenta AND d.empresa_id = n.empresa_id
-        WHERE {cond_sit}
-        GROUP BY n.codigo, n.nombre, n.tipo
-        ORDER BY n.codigo ASC
-    """
-    df_raw = pd.read_sql_query(q_cuentas, conn, params=tuple(params_sit))
+            filas_sit_matriz = []
+            tot_act_corr_mes = {k: 0.0 for k in meses_dict.keys()}
+            tot_act_nocorr_mes = {k: 0.0 for k in meses_dict.keys()}
+            tot_pas_corr_mes = {k: 0.0 for k in meses_dict.keys()}
+            tot_pas_nocorr_mes = {k: 0.0 for k in meses_dict.keys()}
+            tot_cap_mes = {k: 0.0 for k in meses_dict.keys()}
+            util_neta_mes = {k: 0.0 for k in meses_dict.keys()}
 
-    q_res = f"""
-        SELECT 
-            COALESCE(SUM(CASE WHEN n.tipo = 'Ingreso' THEN (d.haber - d.debe) ELSE 0 END), 0) AS tot_ingresos,
-            COALESCE(SUM(CASE WHEN n.tipo = 'Gasto' THEN (d.debe - d.haber) ELSE 0 END), 0) AS tot_gastos
-        FROM libro_diario d
-        JOIN nomenclatura n ON d.codigo_cuenta = n.codigo AND d.empresa_id = n.empresa_id
-        WHERE {cond_sit}
-    """
-    c = conn.cursor()
-    c.execute(q_res, tuple(params_sit))
-    row_res = c.fetchone()
-    tot_ing = float(row_res[0]) if row_res else 0.0
-    tot_gas = float(row_res[1]) if row_res else 0.0
-    conn.close()
+            # 1. ACTIVO CORRIENTE
+            filas_sit_matriz.append({"Estructura Contable": "🏢 ACTIVO CORRIENTE", **{m: "" for m in meses_dict.values()}, "TOTAL ACUMULADO ANUAL": ""})
+            for _, r in act_corr_df[['codigo', 'nombre']].drop_duplicates().iterrows():
+                fila = {"Estructura Contable": f"  • {r['codigo']} - {r['nombre']}"}
+                anual_c = 0.0
+                for cod_m, nom_m in meses_dict.items():
+                    sub = act_corr_df[(act_corr_df['codigo'] == r['codigo']) & (act_corr_df['mes'] == cod_m)]
+                    val = float(sub['total_debe'].sum() - sub['total_haber'].sum()) if not sub.empty else 0.0
+                    fila[nom_m] = f"Q {val:,.2f}"
+                    tot_act_corr_mes[cod_m] += val
+                    anual_c += val
+                fila["TOTAL ACUMULADO ANUAL"] = f"Q {anual_c:,.2f}"
+                filas_sit_matriz.append(fila)
 
-    utilidad_antes_imp = round(tot_ing - tot_gas, 2)
-    monto_imp, ganancia_desp_imp, tasa_nom = calcular_impuesto_renta(selected_empresa_info[3], tot_ing, utilidad_antes_imp)
+            # Subtotal Activo Corriente
+            f_sub_ac = {"Estructura Contable": "(=) Subtotal Activo Corriente"}
+            for cod_m, nom_m in meses_dict.items():
+                f_sub_ac[nom_m] = f"Q {tot_act_corr_mes[cod_m]:,.2f}"
+            f_sub_ac["TOTAL ACUMULADO ANUAL"] = f"Q {sum(tot_act_corr_mes.values()):,.2f}"
+            filas_sit_matriz.append(f_sub_ac)
 
-    if df_raw.empty:
-        st.info("Sin registros en este período.")
+            # 2. ACTIVO NO CORRIENTE
+            filas_sit_matriz.append({"Estructura Contable": "🏢 ACTIVO NO CORRIENTE", **{m: "" for m in meses_dict.values()}, "TOTAL ACUMULADO ANUAL": ""})
+            for _, r in act_nocorr_df[['codigo', 'nombre']].drop_duplicates().iterrows():
+                fila = {"Estructura Contable": f"  • {r['codigo']} - {r['nombre']}"}
+                anual_c = 0.0
+                for cod_m, nom_m in meses_dict.items():
+                    sub = act_nocorr_df[(act_nocorr_df['codigo'] == r['codigo']) & (act_nocorr_df['mes'] == cod_m)]
+                    val = float(sub['total_debe'].sum() - sub['total_haber'].sum()) if not sub.empty else 0.0
+                    fila[nom_m] = f"Q {val:,.2f}"
+                    tot_act_nocorr_mes[cod_m] += val
+                    anual_c += val
+                fila["TOTAL ACUMULADO ANUAL"] = f"Q {anual_c:,.2f}"
+                filas_sit_matriz.append(fila)
+
+            # TOTAL ACTIVO
+            f_tot_act = {"Estructura Contable": "🌟 TOTAL ACTIVO"}
+            for cod_m, nom_m in meses_dict.items():
+                f_tot_act[nom_m] = f"Q {(tot_act_corr_mes[cod_m] + tot_act_nocorr_mes[cod_m]):,.2f}"
+            f_tot_act["TOTAL ACUMULADO ANUAL"] = f"Q {(sum(tot_act_corr_mes.values()) + sum(tot_act_nocorr_mes.values())):,.2f}"
+            filas_sit_matriz.append(f_tot_act)
+
+            # 3. PASIVO CORRIENTE
+            filas_sit_matriz.append({"Estructura Contable": "💳 PASIVO CORRIENTE", **{m: "" for m in meses_dict.values()}, "TOTAL ACUMULADO ANUAL": ""})
+            for _, r in pas_corr_df[['codigo', 'nombre']].drop_duplicates().iterrows():
+                fila = {"Estructura Contable": f"  • {r['codigo']} - {r['nombre']}"}
+                anual_c = 0.0
+                for cod_m, nom_m in meses_dict.items():
+                    sub = pas_corr_df[(pas_corr_df['codigo'] == r['codigo']) & (pas_corr_df['mes'] == cod_m)]
+                    val = float(sub['total_haber'].sum() - sub['total_debe'].sum()) if not sub.empty else 0.0
+                    fila[nom_m] = f"Q {val:,.2f}"
+                    tot_pas_corr_mes[cod_m] += val
+                    anual_c += val
+                fila["TOTAL ACUMULADO ANUAL"] = f"Q {anual_c:,.2f}"
+                filas_sit_matriz.append(fila)
+
+            # Provisión ISR Pasivo
+            f_prov_isr = {"Estructura Contable": "  • 2.1.03.99 - Provisión ISR por Pagar"}
+            tot_isr_pas = 0.0
+            for cod_m, nom_m in meses_dict.items():
+                sub_i = df_sit_raw[(df_sit_raw['tipo'] == 'Ingreso') & (df_sit_raw['mes'] == cod_m)]
+                sub_g = df_sit_raw[(df_sit_raw['tipo'] == 'Gasto') & (df_sit_raw['mes'] == cod_m)]
+                ing_m = float(sub_i['total_haber'].sum() - sub_i['total_debe'].sum()) if not sub_i.empty else 0.0
+                gas_m = float(sub_g['total_debe'].sum() - sub_g['total_haber'].sum()) if not sub_g.empty else 0.0
+                imp, neta, _ = calcular_impuesto_renta(selected_empresa_info[3], ing_m, ing_m - gas_m)
+                f_prov_isr[nom_m] = f"Q {imp:,.2f}"
+                tot_pas_corr_mes[cod_m] += imp
+                util_neta_mes[cod_m] = neta
+                tot_isr_pas += imp
+            f_prov_isr["TOTAL ACUMULADO ANUAL"] = f"Q {tot_isr_pas:,.2f}"
+            filas_sit_matriz.append(f_prov_isr)
+
+            # 4. PATRIMONIO NETO / CAPITAL
+            filas_sit_matriz.append({"Estructura Contable": "🏛️ PATRIMONIO NETO / CAPITAL", **{m: "" for m in meses_dict.values()}, "TOTAL ACUMULADO ANUAL": ""})
+            for _, r in cap_df[['codigo', 'nombre']].drop_duplicates().iterrows():
+                fila = {"Estructura Contable": f"  • {r['codigo']} - {r['nombre']}"}
+                anual_c = 0.0
+                for cod_m, nom_m in meses_dict.items():
+                    sub = cap_df[(cap_df['codigo'] == r['codigo']) & (cap_df['mes'] == cod_m)]
+                    val = float(sub['total_haber'].sum() - sub['total_debe'].sum()) if not sub.empty else 0.0
+                    fila[nom_m] = f"Q {val:,.2f}"
+                    tot_cap_mes[cod_m] += val
+                    anual_c += val
+                fila["TOTAL ACUMULADO ANUAL"] = f"Q {anual_c:,.2f}"
+                filas_sit_matriz.append(fila)
+
+            # Utilidad neta mes a mes incorporada en el patrimonio
+            f_util_pat = {"Estructura Contable": "  • 3.1.02.02 - Utilidad del Período (Desp. Impuesto)"}
+            for cod_m, nom_m in meses_dict.items():
+                f_util_pat[nom_m] = f"Q {util_neta_mes[cod_m]:,.2f}"
+            f_util_pat["TOTAL ACUMULADO ANUAL"] = f"Q {sum(util_neta_mes.values()):,.2f}"
+            filas_sit_matriz.append(f_util_pat)
+
+            # TOTAL PASIVO + PATRIMONIO
+            f_tot_pas_pat = {"Estructura Contable": "🎯 TOTAL PASIVO + PATRIMONIO"}
+            for cod_m, nom_m in meses_dict.items():
+                tot_p = tot_pas_corr_mes[cod_m] + tot_pas_nocorr_mes[cod_m]
+                tot_pat = tot_cap_mes[cod_m] + util_neta_mes[cod_m]
+                f_tot_pas_pat[nom_m] = f"Q {(tot_p + tot_pat):,.2f}"
+            tot_p_anual = sum(tot_pas_corr_mes.values()) + sum(tot_pas_nocorr_mes.values())
+            tot_pat_anual = sum(tot_cap_mes.values()) + sum(util_neta_mes.values())
+            f_tot_pas_pat["TOTAL ACUMULADO ANUAL"] = f"Q {(tot_p_anual + tot_pat_anual):,.2f}"
+            filas_sit_matriz.append(f_tot_pas_pat)
+
+            st.dataframe(pd.DataFrame(filas_sit_matriz), use_container_width=True)
+
     else:
-        df_raw['Saldo'] = df_raw.apply(lambda r: (r['total_debe'] - r['total_haber']) if r['tipo'] == 'Activo' else (r['total_haber'] - r['total_debe']), axis=1)
+        cond_sit = "d.empresa_id = %s"
+        params_sit = [selected_emp_id]
+        tit_sit = f"Acumulado Histórico al {date.today()}"
 
-        act_corr = df_raw[(df_raw['tipo'] == 'Activo') & (df_raw['codigo'].str.startswith('1.1'))]
-        act_nocorr = df_raw[(df_raw['tipo'] == 'Activo') & (df_raw['codigo'].str.startswith('1.2'))]
-        pas_corr = df_raw[(df_raw['tipo'] == 'Pasivo') & (df_raw['codigo'].str.startswith('2.1'))].copy()
-        pas_nocorr = df_raw[(df_raw['tipo'] == 'Pasivo') & (df_raw['codigo'].str.startswith('2.2'))]
-        capital = df_raw[df_raw['tipo'] == 'Capital'].copy()
+        if modo_sit == "📆 Por Año":
+            cond_sit += " AND SUBSTRING(d.fecha FROM 1 FOR 4) = %s"
+            params_sit.append(anio_sel_sit)
+            tit_sit = f"Al cierre del Año Fiscal {anio_sel_sit}"
+        elif modo_sit == "📅 Por Mes":
+            mes_sel_sit = st.selectbox("Seleccionar Mes:", list(meses_dict.keys()), format_func=lambda x: f"{x} - {meses_dict[x]}", key="sit_mes")
+            cond_sit += " AND SUBSTRING(d.fecha FROM 1 FOR 4) = %s AND SUBSTRING(d.fecha FROM 6 FOR 2) = %s"
+            params_sit.extend([anio_sel_sit, mes_sel_sit])
+            tit_sit = f"Al cierre de {meses_dict[mes_sel_sit]} de {anio_sel_sit}"
 
-        tot_pas_corr = float(pas_corr['Saldo'].sum()) + monto_imp
-        tot_pas_nocorr = float(pas_nocorr['Saldo'].sum())
-        total_pasivo = tot_pas_corr + tot_pas_nocorr
+        st.markdown(f"""
+            <div style="background-color: {color_sit}; padding: 10px 18px; border-radius: 8px; color: white; font-weight: bold; margin-bottom: 18px;">
+                🏛️ Estado de Situación Financiera — {tit_sit}
+            </div>
+        """, unsafe_allow_html=True)
 
-        tot_act_corr = float(act_corr['Saldo'].sum())
-        tot_act_nocorr = float(act_nocorr['Saldo'].sum())
-        total_activo = tot_act_corr + tot_act_nocorr
+        conn = get_db_connection()
+        q_cuentas = f"""
+            SELECT n.codigo, n.nombre, n.tipo,
+                   COALESCE(SUM(d.debe), 0) AS total_debe,
+                   COALESCE(SUM(d.haber), 0) AS total_haber
+            FROM nomenclatura n
+            JOIN libro_diario d ON n.codigo = d.codigo_cuenta AND d.empresa_id = n.empresa_id
+            WHERE {cond_sit}
+            GROUP BY n.codigo, n.nombre, n.tipo
+            ORDER BY n.codigo ASC
+        """
+        df_raw = pd.read_sql_query(q_cuentas, conn, params=tuple(params_sit))
 
-        tot_cap = float(capital['Saldo'].sum())
-        total_patrimonio = tot_cap + ganancia_desp_imp
-        total_pasivo_patrimonio = total_pasivo + total_patrimonio
+        q_res = f"""
+            SELECT 
+                COALESCE(SUM(CASE WHEN n.tipo = 'Ingreso' THEN (d.haber - d.debe) ELSE 0 END), 0) AS tot_ingresos,
+                COALESCE(SUM(CASE WHEN n.tipo = 'Gasto' THEN (d.debe - d.haber) ELSE 0 END), 0) AS tot_gastos
+            FROM libro_diario d
+            JOIN nomenclatura n ON d.codigo_cuenta = n.codigo AND d.empresa_id = n.empresa_id
+            WHERE {cond_sit}
+        """
+        c = conn.cursor()
+        c.execute(q_res, tuple(params_sit))
+        row_res = c.fetchone()
+        tot_ing = float(row_res[0]) if row_res else 0.0
+        tot_gas = float(row_res[1]) if row_res else 0.0
+        conn.close()
 
-        r1, r2, r3, r4 = st.columns(4)
-        r1.metric("Total Activo", f"Q {total_activo:,.2f}")
-        r2.metric("Total Pasivo + Patrimonio", f"Q {total_pasivo_patrimonio:,.2f}")
-        r3.metric(f"Impuesto ({tasa_nom})", f"Q {monto_imp:,.2f}")
-        r4.metric("Ganancia Neta Desp. Impuestos", f"Q {ganancia_desp_imp:,.2f}")
+        utilidad_antes_imp = round(tot_ing - tot_gas, 2)
+        monto_imp, ganancia_desp_imp, tasa_nom = calcular_impuesto_renta(selected_empresa_info[3], tot_ing, utilidad_antes_imp)
 
-        st.markdown("---")
-        col_izq, col_der = st.columns(2)
+        if df_raw.empty:
+            st.info("Sin registros en este período.")
+        else:
+            df_raw['Saldo'] = df_raw.apply(lambda r: (r['total_debe'] - r['total_haber']) if r['tipo'] == 'Activo' else (r['total_haber'] - r['total_debe']), axis=1)
 
-        with col_izq:
-            st.markdown("### 🏢 ACTIVO")
-            st.markdown("#### **Activo Corriente**")
-            for _, r in act_corr.iterrows():
-                st.write(f"• **{r['codigo']} - {r['nombre']}**: Q {r['Saldo']:,.2f}")
-            st.info(f"**Total Activo Corriente: Q {tot_act_corr:,.2f}**")
+            act_corr = df_raw[(df_raw['tipo'] == 'Activo') & (df_raw['codigo'].str.startswith('1.1'))]
+            act_nocorr = df_raw[(df_raw['tipo'] == 'Activo') & (df_raw['codigo'].str.startswith('1.2'))]
+            pas_corr = df_raw[(df_raw['tipo'] == 'Pasivo') & (df_raw['codigo'].str.startswith('2.1'))].copy()
+            pas_nocorr = df_raw[(df_raw['tipo'] == 'Pasivo') & (df_raw['codigo'].str.startswith('2.2'))]
+            capital = df_raw[df_raw['tipo'] == 'Capital'].copy()
 
-            st.markdown("#### **Activo No Corriente**")
-            for _, r in act_nocorr.iterrows():
-                st.write(f"• **{r['codigo']} - {r['nombre']}**: Q {r['Saldo']:,.2f}")
-            st.info(f"**Total Activo No Corriente: Q {tot_act_nocorr:,.2f}**")
+            tot_pas_corr = float(pas_corr['Saldo'].sum()) + monto_imp
+            tot_pas_nocorr = float(pas_nocorr['Saldo'].sum())
+            total_pasivo = tot_pas_corr + tot_pas_nocorr
 
-            st.success(f"## **TOTAL ACTIVO: Q {total_activo:,.2f}**")
+            tot_act_corr = float(act_corr['Saldo'].sum())
+            tot_act_nocorr = float(act_nocorr['Saldo'].sum())
+            total_activo = tot_act_corr + tot_act_nocorr
 
-        with col_der:
-            st.markdown("### 💳 PASIVO Y PATRIMONIO NETO")
-            st.markdown("#### **Pasivo Corriente**")
-            for _, r in pas_corr.iterrows():
-                st.write(f"• **{r['codigo']} - {r['nombre']}**: Q {r['Saldo']:,.2f}")
-            if monto_imp > 0:
-                st.write(f"• **2.1.03.99 - Provisión ISR por Pagar**: Q {monto_imp:,.2f}")
-            st.info(f"**Total Pasivo: Q {total_pasivo:,.2f}**")
+            tot_cap = float(capital['Saldo'].sum())
+            total_patrimonio = tot_cap + ganancia_desp_imp
+            total_pasivo_patrimonio = total_pasivo + total_patrimonio
 
-            st.markdown("#### **Patrimonio Neto / Capital**")
-            for _, r in capital.iterrows():
-                st.write(f"• **{r['codigo']} - {r['nombre']}**: Q {r['Saldo']:,.2f}")
-            st.write(f"• **3.1.02.02 - Utilidad del Período (Después de Impuesto)**: Q {ganancia_desp_imp:,.2f}")
-            st.info(f"**Total Patrimonio: Q {total_patrimonio:,.2f}**")
+            r1, r2, r3, r4 = st.columns(4)
+            r1.metric("Total Activo", f"Q {total_activo:,.2f}")
+            r2.metric("Total Pasivo + Patrimonio", f"Q {total_pasivo_patrimonio:,.2f}")
+            r3.metric(f"Impuesto ({tasa_nom})", f"Q {monto_imp:,.2f}")
+            r4.metric("Ganancia Neta Desp. Impuestos", f"Q {ganancia_desp_imp:,.2f}")
 
-            st.success(f"## **TOTAL PASIVO + PATRIMONIO: Q {total_pasivo_patrimonio:,.2f}**")
+            st.markdown("---")
+            col_izq, col_der = st.columns(2)
+
+            with col_izq:
+                st.markdown("### 🏢 ACTIVO")
+                st.markdown("#### **Activo Corriente**")
+                for _, r in act_corr.iterrows():
+                    st.write(f"• **{r['codigo']} - {r['nombre']}**: Q {r['Saldo']:,.2f}")
+                st.info(f"**Total Activo Corriente: Q {tot_act_corr:,.2f}**")
+
+                st.markdown("#### **Activo No Corriente**")
+                for _, r in act_nocorr.iterrows():
+                    st.write(f"• **{r['codigo']} - {r['nombre']}**: Q {r['Saldo']:,.2f}")
+                st.info(f"**Total Activo No Corriente: Q {tot_act_nocorr:,.2f}**")
+
+                st.success(f"## **TOTAL ACTIVO: Q {total_activo:,.2f}**")
+
+            with col_der:
+                st.markdown("### 💳 PASIVO Y PATRIMONIO NETO")
+                st.markdown("#### **Pasivo Corriente**")
+                for _, r in pas_corr.iterrows():
+                    st.write(f"• **{r['codigo']} - {r['nombre']}**: Q {r['Saldo']:,.2f}")
+                if monto_imp > 0:
+                    st.write(f"• **2.1.03.99 - Provisión ISR por Pagar**: Q {monto_imp:,.2f}")
+                st.info(f"**Total Pasivo: Q {total_pasivo:,.2f}**")
+
+                st.markdown("#### **Patrimonio Neto / Capital**")
+                for _, r in capital.iterrows():
+                    st.write(f"• **{r['codigo']} - {r['nombre']}**: Q {r['Saldo']:,.2f}")
+                st.write(f"• **3.1.02.02 - Utilidad del Período (Después de Impuesto)**: Q {ganancia_desp_imp:,.2f}")
+                st.info(f"**Total Patrimonio: Q {total_patrimonio:,.2f}**")
+
+                st.success(f"## **TOTAL PASIVO + PATRIMONIO: Q {total_pasivo_patrimonio:,.2f}**")
 
 # ==========================================
 # 16. ESTADO DE RESULTADOS (ESTRUCTURA CONTABLE BASE COMPLETA EN MATRIZ ACUMULADA)
@@ -1407,12 +1626,6 @@ elif selected_menu == "📉 Estado de Resultados":
     modo_er = col_er1.radio("Visualizar Estado de Resultados por:", ["🌐 Histórico Acumulado (Mes a Mes)", "📆 Por Año", "📅 Por Mes"], horizontal=True, key="er_modo")
     anio_er = col_er2.selectbox("Año Fiscal:", anios_list, key="er_anio")
     color_er = col_er3.color_picker("Color de visualización:", value="#1E3A8A", key="er_color")
-
-    meses_dict = {
-        "01": "Enero", "02": "Febrero", "03": "Marzo", "04": "Abril",
-        "05": "Mayo", "06": "Junio", "07": "Julio", "08": "Agosto",
-        "09": "Septiembre", "10": "Octubre", "11": "Noviembre", "12": "Diciembre"
-    }
 
     if modo_er == "🌐 Histórico Acumulado (Mes a Mes)":
         st.markdown(f"""
@@ -1443,12 +1656,10 @@ elif selected_menu == "📉 Estado de Resultados":
         if df_movs.empty:
             st.info(f"Sin movimientos en el ejercicio fiscal {anio_er}.")
         else:
-            # Separar cuentas por rubro formal
             cuentas_ing = df_movs[df_movs['tipo'] == 'Ingreso'][['codigo', 'nombre']].drop_duplicates().sort_values(by='codigo')
             cuentas_cost = df_movs[(df_movs['tipo'] == 'Gasto') & (df_movs['codigo'].str.startswith('5.1.01'))][['codigo', 'nombre']].drop_duplicates().sort_values(by='codigo')
             cuentas_gast = df_movs[(df_movs['tipo'] == 'Gasto') & (~df_movs['codigo'].str.startswith('5.1.01'))][['codigo', 'nombre']].drop_duplicates().sort_values(by='codigo')
 
-            # Diccionarios para almacenar totales por mes
             tot_ing_mes = {k: 0.0 for k in meses_dict.keys()}
             tot_cost_mes = {k: 0.0 for k in meses_dict.keys()}
             tot_gast_mes = {k: 0.0 for k in meses_dict.keys()}
@@ -1616,7 +1827,6 @@ elif selected_menu == "📉 Estado de Resultados":
 
         tot_i = float(df_i['monto'].sum()) if not df_i.empty else 0.0
         
-        # Clasificación contable formal
         df_costos = df_g[df_g['codigo'].str.startswith('5.1.01')]
         df_gastos_op = df_g[~df_g['codigo'].str.startswith('5.1.01')]
 
