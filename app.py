@@ -54,8 +54,7 @@ def hash_password(password):
 def inicializar_tablas_corporativas():
     conn = get_db_connection()
     c = conn.cursor()
-    # 1. Tabla de Productos Corporativa
-    c.execute('''
+    c.execute("""
         CREATE TABLE IF NOT EXISTS productos (
             id TEXT PRIMARY KEY,
             empresa_id TEXT,
@@ -66,9 +65,8 @@ def inicializar_tablas_corporativas():
             precio_venta NUMERIC DEFAULT 0,
             created_at TEXT
         );
-    ''')
-    # 2. Kárdex de Movimientos
-    c.execute('''
+    """)
+    c.execute("""
         CREATE TABLE IF NOT EXISTS kardex (
             id TEXT PRIMARY KEY,
             empresa_id TEXT NOT NULL,
@@ -81,9 +79,8 @@ def inicializar_tablas_corporativas():
             documento_ref TEXT,
             created_at TEXT
         );
-    ''')
-    # 3. Directorio Corporativo de Terceros
-    c.execute('''
+    """)
+    c.execute("""
         CREATE TABLE IF NOT EXISTS terceros_corporativos (
             id TEXT PRIMARY KEY,
             nit TEXT UNIQUE NOT NULL,
@@ -94,9 +91,8 @@ def inicializar_tablas_corporativas():
             email TEXT,
             created_at TEXT
         );
-    ''')
-    # 4. Cuentas Bancarias
-    c.execute('''
+    """)
+    c.execute("""
         CREATE TABLE IF NOT EXISTS cuentas_bancarias (
             id TEXT PRIMARY KEY,
             empresa_id TEXT NOT NULL,
@@ -107,7 +103,7 @@ def inicializar_tablas_corporativas():
             saldo_inicial NUMERIC DEFAULT 0,
             created_at TEXT
         );
-    ''')
+    """)
     conn.commit()
     conn.close()
 
@@ -154,14 +150,25 @@ def sembrar_nomenclatura_inicial(empresa_id):
         conn.commit()
     conn.close()
 
-def calcular_retenciones(subtotal, aplica_isr, tipo_isr, aplica_iva, tipo_iva):
-    iva = round(subtotal * 0.12, 2)
-    total = round(subtotal + iva, 2)
+# ==========================================
+# CÁLCULOS TRIBUTARIOS Y CONTABLES (DESDE EL TOTAL)
+# ==========================================
+def calcular_desglose_desde_total(monto_total, es_pequeno=False, aplica_isr=False, tipo_isr="No Aplica", aplica_iva=False, tipo_iva="No Aplica"):
+    monto_total = float(monto_total or 0.0)
+    if es_pequeno:
+        subtotal = round(monto_total, 2)
+        iva = 0.0
+        total = subtotal
+    else:
+        subtotal = round(monto_total / 1.12, 2)
+        iva = round(monto_total - subtotal, 2)
+        total = round(monto_total, 2)
+
     monto_isr = 0.0
     tasa_isr = 0.0
     monto_iva = 0.0
     tasa_iva = 0.0
-    
+
     if aplica_isr and subtotal >= 2800.0 and tipo_isr != "No Aplica":
         if tipo_isr == "5% General":
             tasa_isr = 0.05
@@ -172,20 +179,20 @@ def calcular_retenciones(subtotal, aplica_isr, tipo_isr, aplica_iva, tipo_iva):
         elif tipo_isr == "10% Servicios Técnicos/Honorarios":
             tasa_isr = 0.10
             monto_isr = round(subtotal * 0.10, 2)
-            
-    if aplica_iva and tipo_iva != "No Aplica / No es Agente Retenedor":
-        if tipo_iva == "15% Retención IVA (Decreto 20-2006)":
+
+    if aplica_iva and iva > 0 and tipo_iva not in ["No Aplica", "No Aplica / No es Agente Retenedor"]:
+        if "15%" in tipo_iva:
             tasa_iva = 0.15
             monto_iva = round(iva * 0.15, 2)
-        elif tipo_iva == "25% Exportadores / Sector Especial":
+        elif "25%" in tipo_iva:
             tasa_iva = 0.25
             monto_iva = round(iva * 0.25, 2)
-        elif tipo_iva == "100% Retención Total IVA":
+        elif "100%" in tipo_iva:
             tasa_iva = 1.0
             monto_iva = round(iva, 2)
-            
-    total_liquido = round(total - monto_isr - monto_iva, 2)
-    return iva, total, tasa_isr, monto_isr, tasa_iva, monto_iva, total_liquido
+
+    liquido = round(total - monto_isr - monto_iva, 2)
+    return subtotal, iva, total, tasa_isr, monto_isr, tasa_iva, monto_iva, liquido
 
 def calcular_impuesto_renta(regimen_empresa, total_ingresos, utilidad_antes_impuestos):
     impuesto = 0.0
@@ -216,49 +223,89 @@ def calcular_impuesto_renta(regimen_empresa, total_ingresos, utilidad_antes_impu
     ganancia_neta = round(utilidad_antes_impuestos - impuesto, 2)
     return impuesto, ganancia_neta, tasa_desc
 
-def extraer_datos_pdf_fel(file_bytes):
-    datos = {"numero": "", "serie": "", "fecha": date.today(), "nit_emisor": "", "nombre_emisor": "", "nit_receptor": "", "nombre_receptor": "", "monto_total": 0.0}
+# ==========================================
+# EXTRACTOR DE FACTURAS DTE SAT GUATEMALA (FEL)
+# ==========================================
+def extraer_datos_dte_sat(file_bytes):
+    datos = {
+        "numero_dte": "",
+        "serie": "",
+        "fecha": date.today(),
+        "nit_emisor": "",
+        "nombre_emisor": "",
+        "nit_receptor": "",
+        "nombre_receptor": "",
+        "total": 0.0,
+        "es_pequeno": False
+    }
     if not PdfReader:
         return datos
     try:
         reader = PdfReader(io.BytesIO(file_bytes))
-        texto_completo = ""
+        texto = ""
         for page in reader.pages:
-            texto_completo += (page.extract_text() or "") + "\n"
+            t = page.extract_text()
+            if t:
+                texto += t + "\n"
 
-        num_match = re.search(r"N[úu]mero\s*(?:DTE|Autorizaci[oó]n)?[:\s]+([0-9]+)", texto_completo, re.IGNORECASE)
-        if num_match: datos["numero"] = num_match.group(1).strip()
+        if re.search(r'Pequeño\s+Contribuyente|No\s+genera\s+derecho\s+a\s+cr[eé]dito\s+fiscal', texto, re.I):
+            datos["es_pequeno"] = True
 
-        ser_match = re.search(r"Serie[:\s]+([A-F0-9]+)", texto_completo, re.IGNORECASE)
-        if ser_match: datos["serie"] = ser_match.group(1).strip()
+        m_aut = re.search(r'(?:NÚMERO\s+DE\s+AUTORIZACI[OÓ]N|Autorizaci[oó]n|UUID)[\s:\n\r]+([A-F0-9]{8}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{12}|[A-F0-9]{32})', texto, re.I)
+        if m_aut:
+            datos["numero_dte"] = m_aut.group(1).strip()
 
-        fec_match = re.search(r"(\d{2})[-/](\d{2})[-/](\d{4})", texto_completo)
-        if fec_match:
+        m_ser = re.search(r'(?:SERIE|Serie)[\s:\n\r]+([A-F0-9]+)', texto)
+        if m_ser:
+            datos["serie"] = m_ser.group(1).strip()
+
+        m_num = re.search(r'(?:N[uú]mero\s+de\s+DTE|N[UÚ]MERO\s+DTE)[\s:\n\r]+([0-9]+)', texto, re.I)
+        if m_num and not datos["numero_dte"]:
+            datos["numero_dte"] = m_num.group(1).strip()
+
+        meses = {"ene": 1, "feb": 2, "mar": 3, "abr": 4, "may": 5, "jun": 6, "jul": 7, "ago": 8, "sep": 9, "oct": 10, "nov": 11, "dic": 12}
+        m_fec_txt = re.search(r'Fecha(?:\s+y\s+hora)?\s+de\s+emisi[oó]n[\s:\n\r]+(\d{1,2})-([a-zA-Z]{3})-(\d{4})', texto, re.I)
+        if m_fec_txt:
+            d, mes_str, y = m_fec_txt.groups()
+            mes_num = meses.get(mes_str.lower()[:3], 1)
             try:
-                datos["fecha"] = date(int(fec_match.group(3)), int(fec_match.group(2)), int(fec_match.group(1)))
+                datos["fecha"] = date(int(y), mes_num, int(d))
             except Exception:
                 pass
+        else:
+            m_fec = re.search(r'(\d{4}-\d{2}-\d{2}|\d{2}/\d{2}/\d{4})', texto)
+            if m_fec:
+                f_str = m_fec.group(1)
+                try:
+                    if "-" in f_str:
+                        datos["fecha"] = datetime.strptime(f_str, "%Y-%m-%d").date()
+                    else:
+                        datos["fecha"] = datetime.strptime(f_str, "%d/%m/%Y").date()
+                except Exception:
+                    pass
 
-        nit_em_match = re.search(r"NIT\s*(?:del)?\s*Emisor[:\s]+([0-9Kk\-]+)", texto_completo, re.IGNORECASE)
-        if nit_em_match: datos["nit_emisor"] = nit_em_match.group(1).strip()
+        m_nem = re.search(r'Nit\s*Emisor[\s:\n\r]+([0-9Kk\-]+)', texto, re.I)
+        if m_nem:
+            datos["nit_emisor"] = m_nem.group(1).replace("-", "").strip().upper()
 
-        nom_em_match = re.search(r"Nombre\s*(?:del)?\s*Emisor[:\s]+([^\n]+)", texto_completo, re.IGNORECASE)
-        if nom_em_match: datos["nombre_emisor"] = nom_em_match.group(1).strip()
+        m_nomem = re.search(r'Nombre(?:\s+del)?\s+Emisor[\s:\n\r]+([^\n\r]+)', texto, re.I)
+        if m_nomem:
+            datos["nombre_emisor"] = m_nomem.group(1).strip()
 
-        nit_rec_match = re.search(r"NIT\s*(?:del)?\s*Receptor[:\s]+([0-9Kk\-]+|CF|C/F)", texto_completo, re.IGNORECASE)
-        if nit_rec_match:
-            val_nit = nit_rec_match.group(1).strip()
-            datos["nit_receptor"] = "CF" if val_nit.upper() in ["CF", "C/F"] else val_nit
+        m_nrec = re.search(r'NIT\s*Receptor[\s:\n\r]+([0-9Kk\-]+|CF|C/?F)', texto, re.I)
+        if m_nrec:
+            r_nit = m_nrec.group(1).replace("-", "").strip().upper()
+            datos["nit_receptor"] = "CF" if r_nit in ["CF", "C/F"] else r_nit
 
-        nom_rec_match = re.search(r"Nombre\s*(?:del)?\s*Receptor[:\s]+([^\n]+)", texto_completo, re.IGNORECASE)
-        if nom_rec_match: datos["nombre_receptor"] = nom_rec_match.group(1).strip()
+        m_nomrec = re.search(r'Nombre(?:\s+del)?\s+Receptor[\s:\n\r]+([^\n\r]+)', texto, re.I)
+        if m_nomrec:
+            datos["nombre_receptor"] = m_nomrec.group(1).strip()
+        elif datos["nit_receptor"] == "CF":
+            datos["nombre_receptor"] = "CONSUMIDOR FINAL"
 
-        tot_match = re.search(r"Total[:\s]+Q?\.?\s*([0-9,]+\.[0-9]{2})", texto_completo, re.IGNORECASE)
-        if tot_match:
-            try:
-                datos["monto_total"] = float(tot_match.group(1).replace(",", ""))
-            except Exception:
-                pass
+        montos = re.findall(r'(?:TOTAL(?:ES)?|Gran\s+Total|Total\s+General)[\s:\n\r]*(?:Q|GTQ)?\s*([\d,]+\.\d{2})', texto, re.I)
+        if montos:
+            datos["total"] = float(montos[-1].replace(",", ""))
     except Exception:
         pass
     return datos
@@ -454,7 +501,7 @@ with st.sidebar:
     if is_admin:
         menu_options.extend(["👤 Control de Usuarios (Admin)", "🏢 Gestión de Empresas (Admin)"])
 
-    selected_menu = st.radio("Módulo a Trabajar:", menu_options, index=12)
+    selected_menu = st.radio("Módulo a Trabajar:", menu_options, index=3)
 
 # ==========================================
 # COMPONENTE DE ENCABEZADO CORPORATIVO PARA REPORTES
@@ -693,7 +740,7 @@ elif selected_menu == "📅 Desglose Mensual":
     st.dataframe(df_disp, use_container_width=True)
 
 # ==========================================
-# MÓDULO: FACTURA DE COMPRAS
+# MÓDULO: FACTURA DE COMPRAS (INGRESO POR TOTAL)
 # ==========================================
 elif selected_menu == "🛒 Factura de Compras":
     if not selected_emp_id: st.stop()
@@ -705,44 +752,53 @@ elif selected_menu == "🛒 Factura de Compras":
     conn = get_db_connection()
     cuentas_gasto = pd.read_sql_query("SELECT codigo, nombre FROM nomenclatura WHERE empresa_id = %s AND (tipo = 'Gasto' OR tipo = 'Activo') ORDER BY codigo", conn, params=(selected_emp_id,))
     cuentas_pago = pd.read_sql_query("SELECT codigo, nombre FROM nomenclatura WHERE empresa_id = %s AND (tipo = 'Pasivo' OR tipo = 'Activo') ORDER BY codigo", conn, params=(selected_emp_id,))
-    df_terceros_prov = pd.read_sql_query("SELECT nit, nombre FROM terceros_corporativos WHERE tipo IN ('Proveedor', 'Ambos') ORDER BY nombre ASC", conn)
     conn.close()
 
     opciones_gasto = [f"{r['codigo']} - {r['nombre']}" for _, r in cuentas_gasto.iterrows()]
     opciones_pago = [f"{r['codigo']} - {r['nombre']}" for _, r in cuentas_pago.iterrows()]
 
     with tab_reg:
-        pdf_file = st.file_uploader("Arrastra tu Factura PDF (FEL SAT) para autocompletar:", type=["pdf"], key="pdf_compra")
-        datos_pdf = extraer_datos_pdf_fel(pdf_file.read()) if pdf_file else {}
+        pdf_file = st.file_uploader("Arrastra tu Factura PDF (FEL SAT) para autocompletar:", type=["pdf"], key="pdf_compra_uploader")
+        
+        datos_pdf = {}
+        pdf_key_suffix = "manual"
+        if pdf_file:
+            datos_pdf = extraer_datos_dte_sat(pdf_file.read())
+            pdf_key_suffix = f"pdf_{pdf_file.name}_{pdf_file.size}"
 
-        with st.form("form_compra"):
+        es_peq_def = datos_pdf.get("es_pequeno", False) or ("pequeño" in (selected_empresa_info[3] or "").lower())
+
+        with st.form(f"form_compra_{pdf_key_suffix}"):
             c1, c2, c3 = st.columns(3)
-            num_f = c1.text_input("Número de Factura / DTE *", value=datos_pdf.get("numero", ""))
-            ser_f = c2.text_input("Serie", value=datos_pdf.get("serie", ""))
-            fec_f = c3.date_input("Fecha de Emisión *", value=datos_pdf.get("fecha", date.today()))
+            num_f = c1.text_input("Número Factura / Autorización DTE *", value=datos_pdf.get("numero_dte", ""), key=f"c_num_{pdf_key_suffix}")
+            ser_f = c2.text_input("Serie", value=datos_pdf.get("serie", ""), key=f"c_ser_{pdf_key_suffix}")
+            fec_f = c3.date_input("Fecha de Emisión *", value=datos_pdf.get("fecha", date.today()), key=f"c_fec_{pdf_key_suffix}")
 
             c4, c5 = st.columns(2)
-            prv_nit = c4.text_input("NIT Proveedor *", value=datos_pdf.get("nit_emisor", ""))
-            prv_nom = c5.text_input("Nombre Proveedor *", value=datos_pdf.get("nombre_emisor", ""))
+            prv_nit = c4.text_input("NIT Proveedor *", value=datos_pdf.get("nit_emisor", ""), key=f"c_nit_{pdf_key_suffix}")
+            prv_nom = c5.text_input("Nombre Proveedor *", value=datos_pdf.get("nombre_emisor", ""), key=f"c_nom_{pdf_key_suffix}")
 
             c6, c7 = st.columns(2)
             c_gasto = c6.selectbox("Cuenta de Cargo (DEBE - Gasto/Costo) *", opciones_gasto if opciones_gasto else ["5.1.01.01 - Compras de Mercadería"])
             c_pago = c7.selectbox("Cuenta de Pago (HABER - Pasivo/Bancos) *", opciones_pago if opciones_pago else ["2.1.01.01 - Proveedores / Cuentas por Pagar (Crédito)"])
 
-            sub_val = datos_pdf.get("monto_total", 0.0) / 1.12 if datos_pdf.get("monto_total", 0.0) > 0 else 0.0
-            subtotal = st.number_input("Subtotal (Sin IVA) Q *", min_value=0.0, value=float(round(sub_val, 2)), step=50.0, format="%.2f")
+            # INGRESO DIRECTO POR EL TOTAL DE FACTURA
+            total_factura_in = st.number_input("Total de la Factura (Q) *", min_value=0.0, value=float(datos_pdf.get("total", 0.0)), step=50.0, format="%.2f", key=f"c_tot_{pdf_key_suffix}")
+
+            chk_peq = st.checkbox("¿Factura de Pequeño Contribuyente? (No genera Crédito Fiscal)", value=es_peq_def, key=f"c_peq_{pdf_key_suffix}")
 
             r1, r2 = st.columns(2)
-            ap_isr = r1.checkbox("Practicar Retención ISR", value=(subtotal >= 2800.0))
-            t_isr_sel = r1.selectbox("Tasa Retención ISR", ["5% General", "7% Excedente (Sobre Q30k)", "10% Servicios Técnicos/Honorarios", "No Aplica"], index=0 if subtotal >= 2800.0 else 3)
-            ap_iva = r2.checkbox("Practicar Retención IVA", value=False)
-            t_iva_sel = r2.selectbox("Tasa Retención IVA", ["No Aplica / No es Agente Retenedor", "15% Retención IVA (Decreto 20-2006)", "25% Exportadores", "100% Retención Total IVA"])
+            ap_isr = r1.checkbox("Practicar Retención ISR", value=(total_factura_in >= 3136.0 and not chk_peq), key=f"c_aisr_{pdf_key_suffix}")
+            t_isr_sel = r1.selectbox("Tasa Retención ISR", ["5% General", "7% Excedente (Sobre Q30k)", "10% Servicios Técnicos/Honorarios", "No Aplica"], index=0 if (total_factura_in >= 3136.0 and not chk_peq) else 3, key=f"c_tisr_{pdf_key_suffix}")
+            ap_iva = r2.checkbox("Practicar Retención IVA", value=False, key=f"c_aiva_{pdf_key_suffix}")
+            t_iva_sel = r2.selectbox("Tasa Retención IVA", ["No Aplica / No es Agente Retenedor", "15% Retención IVA (Decreto 20-2006)", "25% Exportadores", "100% Retención Total IVA"], key=f"c_tiva_{pdf_key_suffix}")
 
-            iva, tot, t_i, m_i, t_v, m_v, liq = calcular_retenciones(subtotal, ap_isr, t_isr_sel, ap_iva, t_iva_sel)
-            st.info(f"**Total Factura:** Q {tot:,.2f} | **Líquido a Desembolsar:** Q {liq:,.2f}")
+            subtotal_calc, iva_calc, tot_calc, t_i, m_i, t_v, m_v, liq_calc = calcular_desglose_desde_total(total_factura_in, chk_peq, ap_isr, t_isr_sel, ap_iva, t_iva_sel)
+            
+            st.info(f"📊 **Base (Subtotal):** Q {subtotal_calc:,.2f} | **IVA (Crédito Fiscal):** Q {iva_calc:,.2f} | **Total:** Q {tot_calc:,.2f} | **Líquido a Desembolsar:** Q {liq_calc:,.2f}")
 
             if st.form_submit_button("Guardar Factura y Asentar en Diario", type="primary"):
-                if num_f and prv_nit and prv_nom and subtotal > 0:
+                if num_f.strip() and prv_nit.strip() and prv_nom.strip() and total_factura_in > 0:
                     conn = get_db_connection()
                     c = conn.cursor()
                     fac_id = f"fac-c-{int(datetime.now().timestamp())}"
@@ -750,24 +806,24 @@ elif selected_menu == "🛒 Factura de Compras":
                         INSERT INTO terceros_corporativos (id, nit, nombre, tipo, created_at)
                         VALUES (%s, %s, %s, 'Proveedor', %s)
                         ON CONFLICT (nit) DO UPDATE SET nombre = EXCLUDED.nombre
-                    ''', (f"terc-{int(datetime.now().timestamp())}", prv_nit.strip(), prv_nom.strip(), datetime.now().isoformat()))
+                    ''', (f"terc-{int(datetime.now().timestamp())}", prv_nit.strip().upper(), prv_nom.strip(), datetime.now().isoformat()))
 
                     c.execute('''
                         INSERT INTO facturas (id, empresa_id, tipo, numero_factura, serie, fecha, tercero_nombre, tercero_nit, descripcion, tipo_gasto_ingreso, cuenta_nomenclatura, cuenta_pago, forma_pago, subtotal, iva, total, aplica_ret_isr, tasa_ret_isr, monto_ret_isr, aplica_ret_iva, tasa_ret_iva, monto_ret_iva, total_a_pagar_cobrar, created_by, created_at)
                         VALUES (%s, %s, 'COMPRA', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ''', (fac_id, selected_emp_id, num_f.strip(), ser_f.strip(), str(fec_f), prv_nom.strip(), prv_nit.strip(), "Compra Mercadería", "Compra", c_gasto, c_pago, "Contado/Crédito", subtotal, iva, tot,
+                    ''', (fac_id, selected_emp_id, num_f.strip(), ser_f.strip(), str(fec_f), prv_nom.strip(), prv_nit.strip().upper(), "Compra Mercadería", "Compra", c_gasto, c_pago, "Contado/Crédito", subtotal_calc, iva_calc, tot_calc,
                           1 if (ap_isr and t_isr_sel != "No Aplica") else 0, t_i, m_i,
-                          1 if (ap_iva and t_iva_sel != "No Aplica / No es Agente Retenedor") else 0, t_v, m_v, liq, curr_u['username'], datetime.now().isoformat()))
+                          1 if (ap_iva and t_iva_sel != "No Aplica / No es Agente Retenedor") else 0, t_v, m_v, liq_calc, curr_u['username'], datetime.now().isoformat()))
                     conn.commit()
                     conn.close()
 
                     cod_d, nom_d = c_gasto.split(" - ", 1)
                     cod_h, nom_h = c_pago.split(" - ", 1)
-                    registrar_partida_compra(selected_emp_id, fec_f, cod_d, nom_d, cod_h, nom_h, subtotal, iva, m_i, m_v, liq, num_f, prv_nom)
-                    st.success("✅ Factura registrada con éxito.")
+                    registrar_partida_compra(selected_emp_id, fec_f, cod_d, nom_d, cod_h, nom_h, subtotal_calc, iva_calc, m_i, m_v, liq_calc, num_f.strip(), prv_nom.strip())
+                    st.success("✅ Factura de compra registrada con éxito.")
                     st.rerun()
                 else:
-                    st.error("Completa el número de factura, NIT, proveedor y subtotal.")
+                    st.error("Completa el número de factura, NIT, proveedor y un monto total válido.")
 
     with tab_hist:
         conn = get_db_connection()
@@ -790,7 +846,7 @@ elif selected_menu == "🛒 Factura de Compras":
                     st.rerun()
 
 # ==========================================
-# MÓDULO: FACTURA DE VENTAS
+# MÓDULO: FACTURA DE VENTAS (INGRESO POR TOTAL)
 # ==========================================
 elif selected_menu == "📈 Factura de Ventas":
     if not selected_emp_id: st.stop()
@@ -809,7 +865,7 @@ elif selected_menu == "📈 Factura de Ventas":
     opciones_cobro = [f"{r['codigo']} - {r['nombre']}" for _, r in cuentas_cobro.iterrows()]
 
     with tab_v_reg:
-        st.markdown("##### 🔍 Búsqueda rápida de producto del Catálogo Corporativo:")
+        st.markdown("##### 🔍 Selección de Producto Corporativo (Opcional):")
         opc_prods = ["-- Seleccionar Producto --"] + [f"{r['codigo']} | {r['descripcion']} (Sugerido: Q{float(r['precio_venta']):,.2f})" for _, r in df_p_search.iterrows()]
         prod_buscado = st.selectbox("Seleccionar Producto:", opc_prods)
 
@@ -820,51 +876,70 @@ elif selected_menu == "📈 Factura de Ventas":
             if not prod_match.empty:
                 precio_sug_prod = float(prod_match.iloc[0]['precio_venta'])
 
-        pdf_v_file = st.file_uploader("Arrastra Factura FEL de Venta (PDF SAT) para autocompletar:", type=["pdf"], key="pdf_venta")
-        datos_v_pdf = extraer_datos_pdf_fel(pdf_v_file.read()) if pdf_v_file else {}
+        pdf_v_file = st.file_uploader("Arrastra Factura FEL de Venta (PDF SAT) para autocompletar:", type=["pdf"], key="pdf_venta_uploader")
+        
+        datos_v_pdf = {}
+        pdf_v_key_suffix = "manual"
+        if pdf_v_file:
+            datos_v_pdf = extraer_datos_dte_sat(pdf_v_file.read())
+            pdf_v_key_suffix = f"pdf_v_{pdf_v_file.name}_{pdf_v_file.size}"
 
-        with st.form("form_venta"):
+        tot_inicial = float(datos_v_pdf.get("total", 0.0)) if datos_v_pdf.get("total", 0.0) > 0 else precio_sug_prod
+        es_peq_v_def = datos_v_pdf.get("es_pequeno", False) or ("pequeño" in (selected_empresa_info[3] or "").lower())
+
+        with st.form(f"form_venta_{pdf_v_key_suffix}"):
             c1, c2, c3 = st.columns(3)
-            num_v = c1.text_input("Número de Factura / DTE *", value=datos_v_pdf.get("numero", ""))
-            ser_v = c2.text_input("Serie", value=datos_v_pdf.get("serie", ""))
-            fec_v = c3.date_input("Fecha *", value=datos_v_pdf.get("fecha", date.today()))
+            num_v = c1.text_input("Número Factura / Autorización DTE *", value=datos_v_pdf.get("numero_dte", ""), key=f"v_num_{pdf_v_key_suffix}")
+            ser_v = c2.text_input("Serie", value=datos_v_pdf.get("serie", ""), key=f"v_ser_{pdf_v_key_suffix}")
+            fec_v = c3.date_input("Fecha *", value=datos_v_pdf.get("fecha", date.today()), key=f"v_fec_{pdf_v_key_suffix}")
 
             c4, c5 = st.columns(2)
-            c_nit = c4.text_input("NIT Cliente *", value=datos_v_pdf.get("nit_receptor", "CF"))
-            c_nom = c5.text_input("Nombre Cliente *", value=datos_v_pdf.get("nombre_receptor", "CONSUMIDOR FINAL"))
+            c_nit = c4.text_input("NIT Cliente *", value=datos_v_pdf.get("nit_receptor", "CF"), key=f"v_nit_{pdf_v_key_suffix}")
+            
+            nom_cli_def = datos_v_pdf.get("nombre_receptor", "")
+            if not nom_cli_def and c_nit.strip().upper() in ["CF", "C/F"]:
+                nom_cli_def = "CONSUMIDOR FINAL"
+            c_nom = c5.text_input("Nombre Cliente *", value=nom_cli_def, key=f"v_nom_{pdf_v_key_suffix}")
 
             c6, c7 = st.columns(2)
             c_debe_v = c6.selectbox("Cuenta de Cargo (DEBE - Fondos / Clientes) *", opciones_cobro if opciones_cobro else ["1.1.01.01 - Caja General (Efectivo)"])
             c_haber_v = c7.selectbox("Cuenta de Abono (HABER - Ingreso) *", opciones_ing if opciones_ing else ["4.1.01.01 - Ventas de Mercadería"])
 
-            sub_sug = (datos_v_pdf.get("monto_total", 0.0) / 1.12) if datos_v_pdf.get("monto_total", 0.0) > 0 else (precio_sug_prod / 1.12 if precio_sug_prod > 0 else 0.0)
-            subtotal_v = st.number_input("Subtotal (Sin IVA) Q *", min_value=0.0, value=float(round(sub_sug, 2)), step=50.0, format="%.2f")
+            # INGRESO DIRECTO POR EL TOTAL DE FACTURA
+            total_factura_v = st.number_input("Total de la Factura (Q) *", min_value=0.0, value=float(tot_inicial), step=50.0, format="%.2f", key=f"v_tot_{pdf_v_key_suffix}")
+
+            chk_peq_v = st.checkbox("¿Régimen Pequeño Contribuyente? (No genera Débito Fiscal)", value=es_peq_v_def, key=f"v_peq_{pdf_v_key_suffix}")
 
             r1, r2 = st.columns(2)
-            ret_isr_v = r1.checkbox("Cliente nos retuvo ISR", value=False)
-            t_isr_v = r1.selectbox("Tasa ISR Retenida", ["No Aplica", "5% General", "7% Excedente (Sobre Q30k)"])
-            ret_iva_v = r2.checkbox("Cliente nos retuvo IVA", value=False)
-            t_iva_v = r2.selectbox("Tasa IVA Retenida", ["No Aplica / No es Agente Retenedor", "15% Retención IVA (Decreto 20-2006)", "100% Retención Total IVA"])
+            ret_isr_v = r1.checkbox("Cliente nos retuvo ISR", value=False, key=f"v_aisr_{pdf_v_key_suffix}")
+            t_isr_v = r1.selectbox("Tasa ISR Retenida", ["No Aplica", "5% General", "7% Excedente (Sobre Q30k)"], key=f"v_tisr_{pdf_v_key_suffix}")
+            ret_iva_v = r2.checkbox("Cliente nos retuvo IVA", value=False, key=f"v_aiva_{pdf_v_key_suffix}")
+            t_iva_v = r2.selectbox("Tasa IVA Retenida", ["No Aplica / No es Agente Retenedor", "15% Retención IVA (Decreto 20-2006)", "100% Retención Total IVA"], key=f"v_tiva_{pdf_v_key_suffix}")
 
-            iva_v, tot_v, t_iv, m_iv, t_vv, m_vv, liq_v = calcular_retenciones(subtotal_v, ret_isr_v, t_isr_v, ret_iva_v, t_iva_v)
-            st.info(f"**Total Venta:** Q {tot_v:,.2f} | **Líquido a Recibir:** Q {liq_v:,.2f}")
+            subtotal_v, iva_v, tot_v, t_iv, m_iv, t_vv, m_vv, liq_v = calcular_desglose_desde_total(total_factura_v, chk_peq_v, ret_isr_v, t_isr_v, ret_iva_v, t_iva_v)
+
+            st.info(f"📊 **Base (Subtotal):** Q {subtotal_v:,.2f} | **IVA (Débito Fiscal):** Q {iva_v:,.2f} | **Total:** Q {tot_v:,.2f} | **Líquido a Recibir:** Q {liq_v:,.2f}")
 
             if st.form_submit_button("Guardar Factura de Venta y Asentar", type="primary"):
-                if num_v and c_nit and c_nom and subtotal_v > 0:
+                # Asegurar CF
+                if c_nit.strip().upper() in ["CF", "C/F"] and not c_nom.strip():
+                    c_nom = "CONSUMIDOR FINAL"
+
+                if num_v.strip() and c_nit.strip() and c_nom.strip() and total_factura_v > 0:
                     conn = get_db_connection()
                     c = conn.cursor()
                     fac_v_id = f"fac-v-{int(datetime.now().timestamp())}"
-                    if c_nit.upper() != "CF":
+                    if c_nit.strip().upper() not in ["CF", "C/F"]:
                         c.execute('''
                             INSERT INTO terceros_corporativos (id, nit, nombre, tipo, created_at)
                             VALUES (%s, %s, %s, 'Cliente', %s)
                             ON CONFLICT (nit) DO UPDATE SET nombre = EXCLUDED.nombre
-                        ''', (f"terc-{int(datetime.now().timestamp())}", c_nit.strip(), c_nom.strip(), datetime.now().isoformat()))
+                        ''', (f"terc-{int(datetime.now().timestamp())}", c_nit.strip().upper(), c_nom.strip(), datetime.now().isoformat()))
 
                     c.execute('''
                         INSERT INTO facturas (id, empresa_id, tipo, numero_factura, serie, fecha, tercero_nombre, tercero_nit, descripcion, tipo_gasto_ingreso, cuenta_nomenclatura, cuenta_pago, forma_pago, subtotal, iva, total, aplica_ret_isr, tasa_ret_isr, monto_ret_isr, aplica_ret_iva, tasa_ret_iva, monto_ret_iva, total_a_pagar_cobrar, created_by, created_at)
                         VALUES (%s, %s, 'VENTA', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ''', (fac_v_id, selected_emp_id, num_v.strip(), ser_v.strip(), str(fec_v), c_nom.strip(), c_nit.strip(), "Venta", "Venta", c_haber_v, c_debe_v, "Contado/Crédito", subtotal_v, iva_v, tot_v,
+                    ''', (fac_v_id, selected_emp_id, num_v.strip(), ser_v.strip(), str(fec_v), c_nom.strip(), c_nit.strip().upper(), "Venta", "Venta", c_haber_v, c_debe_v, "Contado/Crédito", subtotal_v, iva_v, tot_v,
                           1 if (ret_isr_v and t_isr_v != "No Aplica") else 0, t_iv, m_iv,
                           1 if (ret_iva_v and t_iva_v != "No Aplica / No es Agente Retenedor") else 0, t_vv, m_vv, liq_v, curr_u['username'], datetime.now().isoformat()))
                     conn.commit()
@@ -872,11 +947,11 @@ elif selected_menu == "📈 Factura de Ventas":
 
                     cod_h, nom_h = c_haber_v.split(" - ", 1)
                     cod_d, nom_d = c_debe_v.split(" - ", 1)
-                    registrar_partida_venta(selected_emp_id, fec_v, cod_h, nom_h, cod_d, nom_d, subtotal_v, iva_v, m_iv, m_vv, liq_v, num_v, c_nom)
+                    registrar_partida_venta(selected_emp_id, fec_v, cod_h, nom_h, cod_d, nom_d, subtotal_v, iva_v, m_iv, m_vv, liq_v, num_v.strip(), c_nom.strip())
                     st.success("✅ Venta registrada y partida cuadrada en Diario.")
                     st.rerun()
                 else:
-                    st.error("Completa el número de factura, cliente y un subtotal válido.")
+                    st.error("Completa el número de factura, cliente y un total mayor a cero.")
 
     with tab_v_hist:
         conn = get_db_connection()
@@ -885,7 +960,7 @@ elif selected_menu == "📈 Factura de Ventas":
         st.dataframe(df_ventas, use_container_width=True)
 
 # ==========================================
-# MÓDULO: ESTADO DE RESULTADOS (CON CÁLCULO DE IMPUESTO SAT)
+# MÓDULO: ESTADO DE RESULTADOS (FORMATO MATRICIAL + BASE CONTABLE)
 # ==========================================
 elif selected_menu == "📉 Estado de Resultados":
     if not selected_emp_id: st.stop()
@@ -958,14 +1033,12 @@ elif selected_menu == "📉 Estado de Resultados":
         piv_gast['TOTAL ANUAL'] = piv_gast.sum(axis=1)
         st.dataframe(piv_gast.style.format("Q {:,.2f}"), use_container_width=True)
 
-        # Cálculo de impuestos y utilidad neta
         tot_ing_m = piv_ing.sum(axis=0)
         tot_cost_m = piv_cost.sum(axis=0)
         util_bruta_m = tot_ing_m - tot_cost_m
         tot_gast_m = piv_gast.sum(axis=0)
         util_op_m = util_bruta_m - tot_gast_m
 
-        # Cálculo legal SAT para cada columna (mes a mes y total anual)
         impuestos_cols = {}
         ganancia_neta_cols = {}
         regimen_activo = selected_empresa_info[3]
@@ -1089,7 +1162,6 @@ elif selected_menu == "🏛️ Balance de Situación Financiera":
 
     render_header_reporte(f"🏛️ Estado de Situación Financiera — {modo_sit}", f"Empresa: {selected_empresa_info[1]} | Ejercicio: {anio_sit}", color_sit)
 
-    # Consulta de cuentas
     conn = get_db_connection()
     q_sit = """
         SELECT n.codigo, n.nombre, n.tipo,
@@ -1107,7 +1179,6 @@ elif selected_menu == "🏛️ Balance de Situación Financiera":
     if df_raw.empty:
         st.info("Sin registros contables disponibles.")
     else:
-        # 1. Saldos de Balance
         df_raw['Saldo'] = df_raw.apply(
             lambda r: (r['debe'] - r['haber']) if r['tipo'] == 'Activo' else (r['haber'] - r['debe']), axis=1
         )
@@ -1115,15 +1186,12 @@ elif selected_menu == "🏛️ Balance de Situación Financiera":
         pasivos = df_raw[df_raw['tipo'] == 'Pasivo'].copy()
         capital = df_raw[df_raw['tipo'] == 'Capital'].copy()
 
-        # 2. Obtener resultado del ejercicio (Ingresos - Gastos)
         ingresos_total = df_raw[df_raw['tipo'] == 'Ingreso']['haber'].sum() - df_raw[df_raw['tipo'] == 'Ingreso']['debe'].sum()
         gastos_total = df_raw[df_raw['tipo'] == 'Gasto']['debe'].sum() - df_raw[df_raw['tipo'] == 'Gasto']['haber'].sum()
         utilidad_bruta = float(ingresos_total - gastos_total)
 
-        # 3. Impuesto legal SAT y ganancia neta exacta
         impuesto_renta, ganancia_neta, desc_imp = calcular_impuesto_renta(selected_empresa_info[3], float(ingresos_total), utilidad_bruta)
 
-        # 4. Provisión de ISR en Pasivo si es positivo
         if impuesto_renta > 0:
             nueva_fila_pasivo = pd.DataFrame([{
                 "codigo": "2.1.03.03",
@@ -1135,7 +1203,6 @@ elif selected_menu == "🏛️ Balance de Situación Financiera":
             }])
             pasivos = pd.concat([pasivos, nueva_fila_pasivo], ignore_index=True)
 
-        # 5. Ganancia o Pérdida neta del ejercicio trasladada al Patrimonio
         nueva_fila_capital = pd.DataFrame([{
             "codigo": "3.1.02.02",
             "nombre": "Ganancia / (Pérdida) Neta del Ejercicio",
@@ -1152,7 +1219,6 @@ elif selected_menu == "🏛️ Balance de Situación Financiera":
         tot_pas_cap = round(tot_pas + tot_cap, 2)
         dif_cuadre = round(tot_act - tot_pas_cap, 2)
 
-        # Métricas de Cuadratura
         c1, c2, c3 = st.columns(3)
         c1.metric("Total Activo", f"Q {tot_act:,.2f}")
         c2.metric("Total Pasivo + Patrimonio", f"Q {tot_pas_cap:,.2f}")
