@@ -134,8 +134,10 @@ def sembrar_nomenclatura_inicial(empresa_id):
             ("2.1.02.01", "IVA por Pagar (Débito Fiscal)", "Pasivo"),
             ("2.1.03.01", "Retenciones ISR por Pagar", "Pasivo"),
             ("2.1.03.02", "Retenciones IVA por Pagar", "Pasivo"),
+            ("2.1.03.03", "Provisión ISR por Pagar (Régimen)", "Pasivo"),
             ("3.1.01.01", "Capital Social / Individual", "Capital"),
             ("3.1.02.01", "Resultados Acumulados", "Capital"),
+            ("3.1.02.02", "Ganancia / Pérdida del Ejercicio", "Capital"),
             ("4.1.01.01", "Ventas de Mercadería", "Ingreso"),
             ("4.1.01.02", "Servicios Contables y Profesionales", "Ingreso"),
             ("4.1.01.99", "Otros Ingresos Operacionales", "Ingreso"),
@@ -452,7 +454,7 @@ with st.sidebar:
     if is_admin:
         menu_options.extend(["👤 Control de Usuarios (Admin)", "🏢 Gestión de Empresas (Admin)"])
 
-    selected_menu = st.radio("Módulo a Trabajar:", menu_options, index=4)
+    selected_menu = st.radio("Módulo a Trabajar:", menu_options, index=12)
 
 # ==========================================
 # COMPONENTE DE ENCABEZADO CORPORATIVO PARA REPORTES
@@ -473,7 +475,6 @@ if selected_menu == "📦 Catálogo Corporativo e Inventarios":
     st.caption("Los productos registrados son permanentes a nivel corporativo y visibles en todas tus empresas.")
 
     conn = get_db_connection()
-    # Lectura corporativa global sin filtrar por empresa_id
     try:
         df_prods_corp = pd.read_sql_query(
             "SELECT id, codigo, descripcion, existencia, costo_promedio, precio_venta FROM productos ORDER BY NULLIF(regexp_replace(codigo, '\\D', '', 'g'), '')::int ASC, codigo ASC", 
@@ -483,7 +484,6 @@ if selected_menu == "📦 Catálogo Corporativo e Inventarios":
         df_prods_corp = pd.read_sql_query("SELECT id, codigo, descripcion, existencia, costo_promedio, precio_venta FROM productos ORDER BY codigo ASC", conn)
     conn.close()
 
-    # Cálculo del correlativo correlativo secuencial de 1 a 1,000,000
     next_cod_sugerido = "1"
     if not df_prods_corp.empty:
         cods_numericos = []
@@ -532,7 +532,6 @@ if selected_menu == "📦 Catálogo Corporativo e Inventarios":
         df_mostrar["Precio Sugerido (Q)"] = df_mostrar["Precio Sugerido (Q)"].astype(float).map("Q {:,.2f}".format)
         st.dataframe(df_mostrar[["Código", "Descripción", "Existencia (Stock)", "Costo Promedio (Q)", "Precio Sugerido (Q)"]], use_container_width=True)
 
-        # Solo el Administrador puede borrar
         if is_admin:
             with st.expander("🗑️ Eliminar Producto del Catálogo (Solo Administrador)"):
                 prod_eliminar = st.selectbox("Seleccionar producto para eliminar:", df_prods_corp['codigo'] + " - " + df_prods_corp['descripcion'])
@@ -678,16 +677,18 @@ elif selected_menu == "📅 Desglose Mensual":
         sub_df = df_raw[df_raw['mes'] == cod_m] if not df_raw.empty else pd.DataFrame()
         ing = float(sub_df['total_ingresos'].sum()) if not sub_df.empty else 0.0
         gas = float(sub_df['total_gastos'].sum()) if not sub_df.empty else 0.0
-        filas.append({"Mes": nom_m, "Ingresos (Q)": ing, "Costos y Gastos (Q)": gas, "Utilidad Neta (Q)": ing - gas})
+        imp, neta, _ = calcular_impuesto_renta(selected_empresa_info[3], ing, ing - gas)
+        filas.append({"Mes": nom_m, "Ingresos (Q)": ing, "Costos y Gastos (Q)": gas, "Impuesto ISR (Q)": imp, "Utilidad Neta (Q)": neta})
 
     df_mensual = pd.DataFrame(filas)
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Ingresos Anuales", f"Q {df_mensual['Ingresos (Q)'].sum():,.2f}")
     c2.metric("Gastos Anuales", f"Q {df_mensual['Costos y Gastos (Q)'].sum():,.2f}")
-    c3.metric("Resultado Neto Anual", f"Q {df_mensual['Utilidad Neta (Q)'].sum():,.2f}")
+    c3.metric("Impuesto ISR Anual", f"Q {df_mensual['Impuesto ISR (Q)'].sum():,.2f}")
+    c4.metric("Resultado Neto Anual", f"Q {df_mensual['Utilidad Neta (Q)'].sum():,.2f}")
 
     df_disp = df_mensual.copy()
-    for col in ["Ingresos (Q)", "Costos y Gastos (Q)", "Utilidad Neta (Q)"]:
+    for col in ["Ingresos (Q)", "Costos y Gastos (Q)", "Impuesto ISR (Q)", "Utilidad Neta (Q)"]:
         df_disp[col] = df_disp[col].map("Q {:,.2f}".format)
     st.dataframe(df_disp, use_container_width=True)
 
@@ -745,7 +746,6 @@ elif selected_menu == "🛒 Factura de Compras":
                     conn = get_db_connection()
                     c = conn.cursor()
                     fac_id = f"fac-c-{int(datetime.now().timestamp())}"
-                    # Auto registrar en terceros corporativos si es nuevo
                     c.execute('''
                         INSERT INTO terceros_corporativos (id, nit, nombre, tipo, created_at)
                         VALUES (%s, %s, %s, 'Proveedor', %s)
@@ -809,7 +809,6 @@ elif selected_menu == "📈 Factura de Ventas":
     opciones_cobro = [f"{r['codigo']} - {r['nombre']}" for _, r in cuentas_cobro.iterrows()]
 
     with tab_v_reg:
-        # Buscador interactivo de producto corporativo por descripción o código
         st.markdown("##### 🔍 Búsqueda rápida de producto del Catálogo Corporativo:")
         opc_prods = ["-- Seleccionar Producto --"] + [f"{r['codigo']} | {r['descripcion']} (Sugerido: Q{float(r['precio_venta']):,.2f})" for _, r in df_p_search.iterrows()]
         prod_buscado = st.selectbox("Seleccionar Producto:", opc_prods)
@@ -855,7 +854,6 @@ elif selected_menu == "📈 Factura de Ventas":
                     conn = get_db_connection()
                     c = conn.cursor()
                     fac_v_id = f"fac-v-{int(datetime.now().timestamp())}"
-                    # Guardar tercero corporativo
                     if c_nit.upper() != "CF":
                         c.execute('''
                             INSERT INTO terceros_corporativos (id, nit, nombre, tipo, created_at)
@@ -887,7 +885,7 @@ elif selected_menu == "📈 Factura de Ventas":
         st.dataframe(df_ventas, use_container_width=True)
 
 # ==========================================
-# MÓDULO: ESTADO DE RESULTADOS (FORMATO MATRICIAL + BASE CONTABLE)
+# MÓDULO: ESTADO DE RESULTADOS (CON CÁLCULO DE IMPUESTO SAT)
 # ==========================================
 elif selected_menu == "📉 Estado de Resultados":
     if not selected_emp_id: st.stop()
@@ -932,7 +930,6 @@ elif selected_menu == "📉 Estado de Resultados":
     if df_er_raw.empty:
         st.info(f"Sin movimientos registrados en el ejercicio {anio_er}.")
     else:
-        # Estructura Contable Oficial:
         df_ing = df_er_raw[df_er_raw['tipo'] == 'Ingreso']
         df_costos = df_er_raw[(df_er_raw['tipo'] == 'Gasto') & (df_er_raw['codigo'].str.startswith('5.1.01'))]
         df_gastos = df_er_raw[(df_er_raw['tipo'] == 'Gasto') & (~df_er_raw['codigo'].str.startswith('5.1.01'))]
@@ -961,18 +958,48 @@ elif selected_menu == "📉 Estado de Resultados":
         piv_gast['TOTAL ANUAL'] = piv_gast.sum(axis=1)
         st.dataframe(piv_gast.style.format("Q {:,.2f}"), use_container_width=True)
 
-        # Resumen Formal de Resultados mes a mes
+        # Cálculo de impuestos y utilidad neta
         tot_ing_m = piv_ing.sum(axis=0)
         tot_cost_m = piv_cost.sum(axis=0)
         util_bruta_m = tot_ing_m - tot_cost_m
         tot_gast_m = piv_gast.sum(axis=0)
         util_op_m = util_bruta_m - tot_gast_m
 
-        resumen_df = pd.DataFrame([util_bruta_m, util_op_m], index=["(=) UTILIDAD BRUTA EN VENTAS", "(=) UTILIDAD DE OPERACIÓN"])
+        # Cálculo legal SAT para cada columna (mes a mes y total anual)
+        impuestos_cols = {}
+        ganancia_neta_cols = {}
+        regimen_activo = selected_empresa_info[3]
+
+        for col_name in list(meses) + ['TOTAL ANUAL']:
+            ing_col = float(tot_ing_m[col_name])
+            util_col = float(util_op_m[col_name])
+            imp_val, neta_val, _ = calcular_impuesto_renta(regimen_activo, ing_col, util_col)
+            impuestos_cols[col_name] = imp_val
+            ganancia_neta_cols[col_name] = neta_val
+
+        s_imp = pd.Series(impuestos_cols)
+        s_neta = pd.Series(ganancia_neta_cols)
+
+        resumen_df = pd.DataFrame([
+            tot_ing_m,
+            tot_cost_m,
+            util_bruta_m,
+            tot_gast_m,
+            util_op_m,
+            s_imp,
+            s_neta
+        ], index=[
+            "(+) INGRESOS BRUTOS TOTALES",
+            "(-) COSTO DE VENTAS TOTAL",
+            "(=) UTILIDAD BRUTA EN VENTAS",
+            "(-) GASTOS DE OPERACIÓN TOTAL",
+            "(=) UTILIDAD DE OPERACIÓN ANTES DE IMPUESTOS",
+            "(-) PROVISIÓN IMPUESTO SOBRE LA RENTA (SAT)",
+            "(=) GANANCIA / (PÉRDIDA) NETA DESPUÉS DE IMPUESTOS"
+        ])
         st.markdown("#### **RESUMEN FINANCIERO Y RESULTADOS DEL EJERCICIO**")
         st.dataframe(resumen_df.style.format("Q {:,.2f}"), use_container_width=True)
 
-        # Botones de exportación Excel y PDF
         c_exp1, c_exp2 = st.columns(2)
         excel_data = exportar_reporte_excel(resumen_df, "Estado_Resultados")
         pdf_data = exportar_reporte_pdf(resumen_df.reset_index(), "Estado de Resultados", selected_empresa_info[1], selected_empresa_info[2], f"Ejercicio {anio_er}")
@@ -1039,7 +1066,7 @@ elif selected_menu == "⚖️ Balance General (Saldos)":
         c_exp2.download_button("📄 Descargar Balance (PDF)", exportar_reporte_pdf(df_b, "Balance de Saldos", selected_empresa_info[1], selected_empresa_info[2], f"Ejercicio {anio_bal}"), f"Balance_Saldos_{anio_bal}.pdf", "application/pdf", use_container_width=True)
 
 # ==========================================
-# MÓDULO: BALANCE DE SITUACIÓN FINANCIERA
+# MÓDULO: BALANCE DE SITUACIÓN FINANCIERA (CUADRADO CON GANANCIA)
 # ==========================================
 elif selected_menu == "🏛️ Balance de Situación Financiera":
     if not selected_emp_id: st.stop()
@@ -1062,6 +1089,7 @@ elif selected_menu == "🏛️ Balance de Situación Financiera":
 
     render_header_reporte(f"🏛️ Estado de Situación Financiera — {modo_sit}", f"Empresa: {selected_empresa_info[1]} | Ejercicio: {anio_sit}", color_sit)
 
+    # Consulta de cuentas
     conn = get_db_connection()
     q_sit = """
         SELECT n.codigo, n.nombre, n.tipo,
@@ -1069,34 +1097,84 @@ elif selected_menu == "🏛️ Balance de Situación Financiera":
                COALESCE(SUM(d.haber), 0) AS haber
         FROM nomenclatura n
         JOIN libro_diario d ON n.codigo = d.codigo_cuenta AND d.empresa_id = n.empresa_id
-        WHERE d.empresa_id = %s
+        WHERE d.empresa_id = %s AND (SUBSTRING(d.fecha FROM 1 FOR 4) = %s OR %s = '🌐 Saldo Acumulado')
         GROUP BY n.codigo, n.nombre, n.tipo
         ORDER BY n.codigo ASC
     """
-    df_raw = pd.read_sql_query(q_sit, conn, params=(selected_emp_id,))
+    df_raw = pd.read_sql_query(q_sit, conn, params=(selected_emp_id, anio_sit, modo_sit))
     conn.close()
 
     if df_raw.empty:
         st.info("Sin registros contables disponibles.")
     else:
+        # 1. Saldos de Balance
         df_raw['Saldo'] = df_raw.apply(
             lambda r: (r['debe'] - r['haber']) if r['tipo'] == 'Activo' else (r['haber'] - r['debe']), axis=1
         )
-        activos = df_raw[df_raw['tipo'] == 'Activo']
-        pasivos = df_raw[df_raw['tipo'] == 'Pasivo']
-        capital = df_raw[df_raw['tipo'] == 'Capital']
+        activos = df_raw[df_raw['tipo'] == 'Activo'].copy()
+        pasivos = df_raw[df_raw['tipo'] == 'Pasivo'].copy()
+        capital = df_raw[df_raw['tipo'] == 'Capital'].copy()
+
+        # 2. Obtener resultado del ejercicio (Ingresos - Gastos)
+        ingresos_total = df_raw[df_raw['tipo'] == 'Ingreso']['haber'].sum() - df_raw[df_raw['tipo'] == 'Ingreso']['debe'].sum()
+        gastos_total = df_raw[df_raw['tipo'] == 'Gasto']['debe'].sum() - df_raw[df_raw['tipo'] == 'Gasto']['haber'].sum()
+        utilidad_bruta = float(ingresos_total - gastos_total)
+
+        # 3. Impuesto legal SAT y ganancia neta exacta
+        impuesto_renta, ganancia_neta, desc_imp = calcular_impuesto_renta(selected_empresa_info[3], float(ingresos_total), utilidad_bruta)
+
+        # 4. Provisión de ISR en Pasivo si es positivo
+        if impuesto_renta > 0:
+            nueva_fila_pasivo = pd.DataFrame([{
+                "codigo": "2.1.03.03",
+                "nombre": f"Provisión ISR por Pagar ({desc_imp})",
+                "tipo": "Pasivo",
+                "debe": 0.0,
+                "haber": impuesto_renta,
+                "Saldo": impuesto_renta
+            }])
+            pasivos = pd.concat([pasivos, nueva_fila_pasivo], ignore_index=True)
+
+        # 5. Ganancia o Pérdida neta del ejercicio trasladada al Patrimonio
+        nueva_fila_capital = pd.DataFrame([{
+            "codigo": "3.1.02.02",
+            "nombre": "Ganancia / (Pérdida) Neta del Ejercicio",
+            "tipo": "Capital",
+            "debe": 0.0,
+            "haber": ganancia_neta,
+            "Saldo": ganancia_neta
+        }])
+        capital = pd.concat([capital, nueva_fila_capital], ignore_index=True)
+
+        tot_act = float(activos['Saldo'].sum())
+        tot_pas = float(pasivos['Saldo'].sum())
+        tot_cap = float(capital['Saldo'].sum())
+        tot_pas_cap = round(tot_pas + tot_cap, 2)
+        dif_cuadre = round(tot_act - tot_pas_cap, 2)
+
+        # Métricas de Cuadratura
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total Activo", f"Q {tot_act:,.2f}")
+        c2.metric("Total Pasivo + Patrimonio", f"Q {tot_pas_cap:,.2f}")
+        c3.metric("Diferencia de Balance", f"Q {dif_cuadre:,.2f}", delta="Balance Cuadrado ✅" if abs(dif_cuadre) < 0.05 else "Descuadre ⚠️")
+
+        st.divider()
 
         col_a, col_p = st.columns(2)
         with col_a:
             st.markdown("### 🏢 ACTIVO")
             st.dataframe(activos[['codigo', 'nombre', 'Saldo']].style.format({"Saldo": "Q {:,.2f}"}), use_container_width=True)
-            st.info(f"**Total Activo: Q {activos['Saldo'].sum():,.2f}**")
+            st.success(f"**TOTAL ACTIVO: Q {tot_act:,.2f}**")
         with col_p:
-            st.markdown("### 💳 PASIVO Y PATRIMONIO")
+            st.markdown("### 💳 PASIVO")
             st.dataframe(pasivos[['codigo', 'nombre', 'Saldo']].style.format({"Saldo": "Q {:,.2f}"}), use_container_width=True)
-            st.info(f"**Total Pasivo: Q {pasivos['Saldo'].sum():,.2f}**")
+            st.info(f"**Total Pasivo: Q {tot_pas:,.2f}**")
+
+            st.markdown("### 🏛️ PATRIMONIO NETO")
             st.dataframe(capital[['codigo', 'nombre', 'Saldo']].style.format({"Saldo": "Q {:,.2f}"}), use_container_width=True)
-            st.info(f"**Total Capital: Q {capital['Saldo'].sum():,.2f}**")
+            st.info(f"**Total Patrimonio: Q {tot_cap:,.2f}**")
+
+            st.success(f"**TOTAL PASIVO Y PATRIMONIO: Q {tot_pas_cap:,.2f}**")
 
 # ==========================================
 # MÓDULO: CUENTAS BANCARIAS
