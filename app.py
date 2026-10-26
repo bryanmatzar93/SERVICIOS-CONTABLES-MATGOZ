@@ -116,6 +116,15 @@ def inicializar_tablas_sistema():
                 created_at TEXT
             );
         """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS nomenclatura (
+                id TEXT PRIMARY KEY,
+                empresa_id TEXT NOT NULL,
+                codigo TEXT NOT NULL,
+                nombre TEXT NOT NULL,
+                tipo TEXT NOT NULL
+            );
+        """)
         conn.commit()
         conn.close()
     except Exception:
@@ -158,8 +167,10 @@ def sembrar_nomenclatura_inicial(empresa_id):
                 ("5.1.02.04", "Combustibles y Lubricantes", "Gasto"),
                 ("5.1.02.99", "Gastos Generales", "Gasto"),
             ]
-            c.executemany("INSERT INTO nomenclatura (empresa_id, codigo, nombre, tipo) VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING",
-                          [(empresa_id, cod, nom, t) for cod, nom, t in base])
+            c.executemany("""
+                INSERT INTO nomenclatura (id, empresa_id, codigo, nombre, tipo) 
+                VALUES (%s, %s, %s, %s, %s)
+            """, [(f"nom-{empresa_id}-{cod}", empresa_id, cod, nom, t) for cod, nom, t in base])
             conn.commit()
         conn.close()
     except Exception:
@@ -192,7 +203,7 @@ def calcular_impuesto_renta(regimen_empresa, total_ingresos, utilidad_antes_impu
     return impuesto, ganancia_neta, tasa_desc
 
 # ==========================================
-# EXPORTACIONES OFICIALES
+# EXPORTACIONES OFICIALES (PDF CON FOLIO Y EXCEL)
 # ==========================================
 def exportar_libro_pdf(df_datos, titulo_libro, empresa_nom, empresa_nit, resolucion_sat="2026-5-12345-001", folio_inicio=1):
     buffer = io.BytesIO()
@@ -649,7 +660,7 @@ elif selected_menu == "📈 Factura de Ventas":
                     c.execute("INSERT INTO libro_diario VALUES (DEFAULT, %s, %s, %s, %s, %s, %s, 0, %s, %s, %s)", (selected_emp_id, p_no, str(fecha_fac), cod_d, nom_d, liq_v, glosa, num_fac, now_str))
                     if m_isr_v > 0: c.execute("INSERT INTO libro_diario VALUES (DEFAULT, %s, %s, %s, '1.1.03.02', 'ISR Retenido por Acreditar', %s, 0, %s, %s, %s)", (selected_emp_id, p_no, str(fecha_fac), m_isr_v, glosa, num_fac, now_str))
                     if m_iva_v > 0: c.execute("INSERT INTO libro_diario VALUES (DEFAULT, %s, %s, %s, '1.1.03.03', 'Constancias Retención IVA', %s, 0, %s, %s, %s)", (selected_emp_id, p_no, str(fecha_fac), m_iva_v, glosa, num_fac, now_str))
-                    c.execute("INSERT INTO libro_diario VALUES (DEFAULT, %s, %s, %s, %s, %s, 0, %s, %s, %s, %s)", (selected_emp_id, p_no, str(fecha_fac), cod_h, nom_h, subtotal_v, glosa, num_fac, now_str))
+                    c.execute("INSERT INTO libro_diario VALUES (DEFAULT, %s, %s, %s, %s, %s, 0, %s, %s, %s)", (selected_emp_id, p_no, str(fecha_fac), cod_h, nom_h, subtotal_v, glosa, num_fac, now_str))
                     if iva_v > 0: c.execute("INSERT INTO libro_diario VALUES (DEFAULT, %s, %s, %s, '2.1.02.01', 'IVA por Pagar', 0, %s, %s, %s, %s)", (selected_emp_id, p_no, str(fecha_fac), iva_v, glosa, num_fac, now_str))
 
                     try:
@@ -866,7 +877,7 @@ elif selected_menu == "🛒 Factura de Compras":
                     if iva_compra > 0: c.execute("INSERT INTO libro_diario VALUES (DEFAULT, %s, %s, %s, '1.1.03.01', 'IVA por Cobrar', %s, 0, %s, %s, %s)", (selected_emp_id, p_no, str(fecha_fac), iva_compra, glosa, num_fac, now_str))
                     if m_isr_c > 0: c.execute("INSERT INTO libro_diario VALUES (DEFAULT, %s, %s, %s, '2.1.03.01', 'Retenciones ISR por Pagar', 0, %s, %s, %s, %s)", (selected_emp_id, p_no, str(fecha_fac), m_isr_c, glosa, num_fac, now_str))
                     if m_iva_c > 0: c.execute("INSERT INTO libro_diario VALUES (DEFAULT, %s, %s, %s, '2.1.03.02', 'Retenciones IVA por Pagar', 0, %s, %s, %s, %s)", (selected_emp_id, p_no, str(fecha_fac), m_iva_c, glosa, num_fac, now_str))
-                    c.execute("INSERT INTO libro_diario VALUES (DEFAULT, %s, %s, %s, %s, %s, 0, %s, %s, %s, %s)", (selected_emp_id, p_no, str(fecha_fac), cod_h, nom_h, liq_c, glosa, num_fac, now_str))
+                    c.execute("INSERT INTO libro_diario VALUES (DEFAULT, %s, %s, %s, %s, %s, 0, %s, %s, %s)", (selected_emp_id, p_no, str(fecha_fac), cod_h, nom_h, liq_c, glosa, num_fac, now_str))
 
                     if destino_bien == "Activo Fijo / No Corriente":
                         c.execute("""
@@ -987,7 +998,7 @@ elif selected_menu == "📦 Control de Inventarios (Kárdex)":
         st.dataframe(df_art_corp, use_container_width=True)
 
 # ==========================================
-# 5. ESTADO DE RESULTADOS (OFICIAL Y MATRICIAL)
+# 5. ESTADO DE RESULTADOS
 # ==========================================
 elif selected_menu == "📉 Estado de Resultados":
     if not selected_emp_id: st.stop()
@@ -1028,7 +1039,6 @@ elif selected_menu == "📉 Estado de Resultados":
         totales_cos_m = {m: 0.0 for m in range(1, 13)}
         totales_gas_m = {m: 0.0 for m in range(1, 13)}
 
-        # 1. INGRESOS
         filas_matriz.append({"Concepto Contable": "1. (+) INGRESOS OPERACIONALES", **{meses_nombres[m-1]: "" for m in range(1, 13)}, "TOTAL ACUMULADO": ""})
         for _, r in cuentas_unicas[cuentas_unicas['tipo'] == 'Ingreso'].iterrows():
             fila_c = {"Concepto Contable": f"  {r['codigo']} - {r['nombre']}"}
@@ -1043,7 +1053,6 @@ elif selected_menu == "📉 Estado de Resultados":
             filas_matriz.append(fila_c)
         filas_matriz.append({"Concepto Contable": "  (=) SUBTOTAL INGRESOS", **{meses_nombres[m-1]: round(totales_ing_m[m], 2) for m in range(1, 13)}, "TOTAL ACUMULADO": round(sum(totales_ing_m.values()), 2)})
 
-        # 2. COSTO DE VENTAS
         filas_matriz.append({"Concepto Contable": "2. (-) COSTO DE VENTAS", **{meses_nombres[m-1]: "" for m in range(1, 13)}, "TOTAL ACUMULADO": ""})
         for _, r in cuentas_unicas[cuentas_unicas['tipo'] == 'Costo'].iterrows():
             fila_c = {"Concepto Contable": f"  {r['codigo']} - {r['nombre']}"}
@@ -1058,11 +1067,9 @@ elif selected_menu == "📉 Estado de Resultados":
             filas_matriz.append(fila_c)
         filas_matriz.append({"Concepto Contable": "  (=) SUBTOTAL COSTO DE VENTAS", **{meses_nombres[m-1]: round(totales_cos_m[m], 2) for m in range(1, 13)}, "TOTAL ACUMULADO": round(sum(totales_cos_m.values()), 2)})
 
-        # 3. UTILIDAD BRUTA
         util_bruta_m = {m: totales_ing_m[m] - totales_cos_m[m] for m in range(1, 13)}
         filas_matriz.append({"Concepto Contable": "3. (=) UTILIDAD BRUTA EN VENTAS", **{meses_nombres[m-1]: round(util_bruta_m[m], 2) for m in range(1, 13)}, "TOTAL ACUMULADO": round(sum(util_bruta_m.values()), 2)})
 
-        # 4. GASTOS DE OPERACIÓN
         filas_matriz.append({"Concepto Contable": "4. (-) GASTOS DE OPERACIÓN Y ADMINISTRACIÓN", **{meses_nombres[m-1]: "" for m in range(1, 13)}, "TOTAL ACUMULADO": ""})
         for _, r in cuentas_unicas[cuentas_unicas['tipo'] == 'Gasto'].iterrows():
             fila_c = {"Concepto Contable": f"  {r['codigo']} - {r['nombre']}"}
@@ -1077,11 +1084,9 @@ elif selected_menu == "📉 Estado de Resultados":
             filas_matriz.append(fila_c)
         filas_matriz.append({"Concepto Contable": "  (=) SUBTOTAL GASTOS OPERATIVOS", **{meses_nombres[m-1]: round(totales_gas_m[m], 2) for m in range(1, 13)}, "TOTAL ACUMULADO": round(sum(totales_gas_m.values()), 2)})
 
-        # 5. UTILIDAD DE OPERACIÓN
         util_op_m = {m: util_bruta_m[m] - totales_gas_m[m] for m in range(1, 13)}
         filas_matriz.append({"Concepto Contable": "5. (=) UTILIDAD DE OPERACIÓN", **{meses_nombres[m-1]: round(util_op_m[m], 2) for m in range(1, 13)}, "TOTAL ACUMULADO": round(sum(util_op_m.values()), 2)})
 
-        # 6. IMPUESTO ISR Y GANANCIA NETA
         isr_m = {}
         ganancia_m = {}
         for m in range(1, 13):
@@ -1146,7 +1151,7 @@ elif selected_menu == "📉 Estado de Resultados":
         col_d2.download_button("📄 Descargar PDF", pdf_p, f"ER_{lbl_periodo}.pdf", "application/pdf")
 
 # ==========================================
-# 6. BALANCE DE SITUACIÓN FINANCIERA (CLASIFICADO CON GANANCIA)
+# 6. BALANCE DE SITUACIÓN FINANCIERA
 # ==========================================
 elif selected_menu == "🏛️ Balance Situación Financiera":
     if not selected_emp_id: st.stop()
@@ -1161,7 +1166,6 @@ elif selected_menu == "🏛️ Balance Situación Financiera":
     meses_nombres = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"]
 
     conn = get_db_connection()
-    # Extraer todos los movimientos de cuentas de balance y de resultados
     q_bsf = """
         SELECT n.codigo, n.nombre, n.tipo,
                EXTRACT(MONTH FROM d.fecha::date)::int AS mes,
@@ -1183,7 +1187,6 @@ elif selected_menu == "🏛️ Balance Situación Financiera":
 
         cuentas_balance = df_raw_bsf[['codigo', 'nombre', 'tipo']].drop_duplicates()
 
-        # Calcular ganancia neta mes a mes para incluirla en Patrimonio
         ganancia_neta_m = {}
         for m in range(1, 13):
             sub_m = df_raw_bsf[df_raw_bsf['mes'] == m]
@@ -1207,7 +1210,6 @@ elif selected_menu == "🏛️ Balance Situación Financiera":
         tot_pas_nocorr_m = {m: 0.0 for m in range(1, 13)}
         tot_cap_m = {m: 0.0 for m in range(1, 13)}
 
-        # 1. ACTIVO CORRIENTE (1.1.x)
         filas_bsf_mat.append({"Rubro / Cuenta Contable": "1. ACTIVO CORRIENTE", **{meses_nombres[m-1]: "" for m in range(1, 13)}, "TOTAL ACUMULADO": ""})
         for _, r in cuentas_balance[(cuentas_balance['tipo'] == 'Activo') & (cuentas_balance['codigo'].str.startswith('1.1.'))].iterrows():
             fila_c = {"Rubro / Cuenta Contable": f"  {r['codigo']} - {r['nombre']}"}
@@ -1222,7 +1224,6 @@ elif selected_menu == "🏛️ Balance Situación Financiera":
             filas_bsf_mat.append(fila_c)
         filas_bsf_mat.append({"Rubro / Cuenta Contable": "  (=) SUBTOTAL ACTIVO CORRIENTE", **{meses_nombres[m-1]: round(tot_act_corr_m[m], 2) for m in range(1, 13)}, "TOTAL ACUMULADO": round(sum(tot_act_corr_m.values()), 2)})
 
-        # 2. ACTIVO NO CORRIENTE (1.2.x o superior)
         filas_bsf_mat.append({"Rubro / Cuenta Contable": "2. ACTIVO NO CORRIENTE", **{meses_nombres[m-1]: "" for m in range(1, 13)}, "TOTAL ACUMULADO": ""})
         for _, r in cuentas_balance[(cuentas_balance['tipo'] == 'Activo') & (~cuentas_balance['codigo'].str.startswith('1.1.'))].iterrows():
             fila_c = {"Rubro / Cuenta Contable": f"  {r['codigo']} - {r['nombre']}"}
@@ -1237,11 +1238,9 @@ elif selected_menu == "🏛️ Balance Situación Financiera":
             filas_bsf_mat.append(fila_c)
         filas_bsf_mat.append({"Rubro / Cuenta Contable": "  (=) SUBTOTAL ACTIVO NO CORRIENTE", **{meses_nombres[m-1]: round(tot_act_nocorr_m[m], 2) for m in range(1, 13)}, "TOTAL ACUMULADO": round(sum(tot_act_nocorr_m.values()), 2)})
 
-        # TOTAL ACTIVO
         tot_activo_m = {m: tot_act_corr_m[m] + tot_act_nocorr_m[m] for m in range(1, 13)}
         filas_bsf_mat.append({"Rubro / Cuenta Contable": "TOTAL ACTIVO", **{meses_nombres[m-1]: round(tot_activo_m[m], 2) for m in range(1, 13)}, "TOTAL ACUMULADO": round(sum(tot_activo_m.values()), 2)})
 
-        # 3. PASIVO CORRIENTE (2.1.x)
         filas_bsf_mat.append({"Rubro / Cuenta Contable": "3. PASIVO CORRIENTE", **{meses_nombres[m-1]: "" for m in range(1, 13)}, "TOTAL ACUMULADO": ""})
         for _, r in cuentas_balance[(cuentas_balance['tipo'] == 'Pasivo') & (cuentas_balance['codigo'].str.startswith('2.1.'))].iterrows():
             fila_c = {"Rubro / Cuenta Contable": f"  {r['codigo']} - {r['nombre']}"}
@@ -1256,7 +1255,6 @@ elif selected_menu == "🏛️ Balance Situación Financiera":
             filas_bsf_mat.append(fila_c)
         filas_bsf_mat.append({"Rubro / Cuenta Contable": "  (=) SUBTOTAL PASIVO CORRIENTE", **{meses_nombres[m-1]: round(tot_pas_corr_m[m], 2) for m in range(1, 13)}, "TOTAL ACUMULADO": round(sum(tot_pas_corr_m.values()), 2)})
 
-        # 4. PASIVO NO CORRIENTE (2.2.x o superior)
         filas_bsf_mat.append({"Rubro / Cuenta Contable": "4. PASIVO NO CORRIENTE", **{meses_nombres[m-1]: "" for m in range(1, 13)}, "TOTAL ACUMULADO": ""})
         for _, r in cuentas_balance[(cuentas_balance['tipo'] == 'Pasivo') & (~cuentas_balance['codigo'].str.startswith('2.1.'))].iterrows():
             fila_c = {"Rubro / Cuenta Contable": f"  {r['codigo']} - {r['nombre']}"}
@@ -1274,7 +1272,6 @@ elif selected_menu == "🏛️ Balance Situación Financiera":
         tot_pasivo_m = {m: tot_pas_corr_m[m] + tot_pas_nocorr_m[m] for m in range(1, 13)}
         filas_bsf_mat.append({"Rubro / Cuenta Contable": "TOTAL PASIVO", **{meses_nombres[m-1]: round(tot_pasivo_m[m], 2) for m in range(1, 13)}, "TOTAL ACUMULADO": round(sum(tot_pasivo_m.values()), 2)})
 
-        # 5. PATRIMONIO NETO CON GANANCIA DEL EJERCICIO
         filas_bsf_mat.append({"Rubro / Cuenta Contable": "5. PATRIMONIO NETO", **{meses_nombres[m-1]: "" for m in range(1, 13)}, "TOTAL ACUMULADO": ""})
         for _, r in cuentas_balance[cuentas_balance['tipo'] == 'Capital'].iterrows():
             fila_c = {"Rubro / Cuenta Contable": f"  {r['codigo']} - {r['nombre']}"}
@@ -1288,7 +1285,6 @@ elif selected_menu == "🏛️ Balance Situación Financiera":
             fila_c["TOTAL ACUMULADO"] = round(acum_cta, 2)
             filas_bsf_mat.append(fila_c)
 
-        # Fila especial: Ganancia Neta del Ejercicio
         filas_bsf_mat.append({
             "Rubro / Cuenta Contable": "  (+) GANANCIA / (PÉRDIDA) NETA DEL EJERCICIO",
             **{meses_nombres[m-1]: round(ganancia_neta_m[m], 2) for m in range(1, 13)},
@@ -1298,7 +1294,6 @@ elif selected_menu == "🏛️ Balance Situación Financiera":
         tot_patrimonio_m = {m: tot_cap_m[m] + ganancia_neta_m[m] for m in range(1, 13)}
         filas_bsf_mat.append({"Rubro / Cuenta Contable": "TOTAL PATRIMONIO NETO", **{meses_nombres[m-1]: round(tot_patrimonio_m[m], 2) for m in range(1, 13)}, "TOTAL ACUMULADO": round(sum(tot_patrimonio_m.values()), 2)})
 
-        # TOTAL PASIVO + PATRIMONIO NETO (Cuadratura)
         tot_pas_pat_m = {m: tot_pasivo_m[m] + tot_patrimonio_m[m] for m in range(1, 13)}
         filas_bsf_mat.append({"Rubro / Cuenta Contable": "TOTAL PASIVO + PATRIMONIO NETO", **{meses_nombres[m-1]: round(tot_pas_pat_m[m], 2) for m in range(1, 13)}, "TOTAL ACUMULADO": round(sum(tot_pas_pat_m.values()), 2)})
 
@@ -1320,24 +1315,20 @@ elif selected_menu == "🏛️ Balance Situación Financiera":
             df_bsf_periodo = df_raw_bsf
             lbl_bsf = f"Año Fiscal {anio_bsf}"
 
-        # Cálculos de resultados en el período para la ganancia del ejercicio
         tot_ing_b = float(df_bsf_periodo[df_bsf_periodo['tipo']=='Ingreso']['haber'].sum() - df_bsf_periodo[df_bsf_periodo['tipo']=='Ingreso']['debe'].sum())
         tot_cos_b = float(df_bsf_periodo[df_bsf_periodo['tipo']=='Costo']['debe'].sum() - df_bsf_periodo[df_bsf_periodo['tipo']=='Costo']['haber'].sum())
         tot_gas_b = float(df_bsf_periodo[df_bsf_periodo['tipo']=='Gasto']['debe'].sum() - df_bsf_periodo[df_bsf_periodo['tipo']=='Gasto']['haber'].sum())
         util_op_b = (tot_ing_b - tot_cos_b) - tot_gas_b
         _, ganancia_ejercicio_b, _ = calcular_impuesto_renta(reg_emp, tot_ing_b, util_op_b)
 
-        # Activo Corriente y No Corriente
         act_corr = float(df_bsf_periodo[(df_bsf_periodo['tipo']=='Activo') & (df_bsf_periodo['codigo'].str.startswith('1.1.'))]['debe'].sum() - df_bsf_periodo[(df_bsf_periodo['tipo']=='Activo') & (df_bsf_periodo['codigo'].str.startswith('1.1.'))]['haber'].sum())
         act_nocorr = float(df_bsf_periodo[(df_bsf_periodo['tipo']=='Activo') & (~df_bsf_periodo['codigo'].str.startswith('1.1.'))]['debe'].sum() - df_bsf_periodo[(df_bsf_periodo['tipo']=='Activo') & (~df_bsf_periodo['codigo'].str.startswith('1.1.'))]['haber'].sum())
         tot_activo_b = act_corr + act_nocorr
 
-        # Pasivo Corriente y No Corriente
         pas_corr = float(df_bsf_periodo[(df_bsf_periodo['tipo']=='Pasivo') & (df_bsf_periodo['codigo'].str.startswith('2.1.'))]['haber'].sum() - df_bsf_periodo[(df_bsf_periodo['tipo']=='Pasivo') & (df_bsf_periodo['codigo'].str.startswith('2.1.'))]['debe'].sum())
         pas_nocorr = float(df_bsf_periodo[(df_bsf_periodo['tipo']=='Pasivo') & (~df_bsf_periodo['codigo'].str.startswith('2.1.'))]['haber'].sum() - df_bsf_periodo[(df_bsf_periodo['tipo']=='Pasivo') & (~df_bsf_periodo['codigo'].str.startswith('2.1.'))]['debe'].sum())
         tot_pasivo_b = pas_corr + pas_nocorr
 
-        # Patrimonio
         capital_b = float(df_bsf_periodo[df_bsf_periodo['tipo']=='Capital']['haber'].sum() - df_bsf_periodo[df_bsf_periodo['tipo']=='Capital']['debe'].sum())
         tot_patrimonio_b = capital_b + ganancia_ejercicio_b
         tot_pas_pat_b = tot_pasivo_b + tot_patrimonio_b
@@ -1405,7 +1396,7 @@ elif selected_menu == "📋 Libro de Compras (SAT)":
     st.title(f"📋 Libro de Compras Tributario — {selected_empresa_info[1]}")
     conn = get_db_connection()
     df_compras_sat = pd.read_sql_query("""
-        SELECT fecha AS "Fecha", serie AS "Serie", numero_factura AS "Factura", tercero_nit AS "NIT Proveedor",
+        SELECT fecha AS "Fecha", serie AS "Serie", numero_factura AS "Factura",欺tercero_nit AS "NIT Proveedor",
                tercero_nombre AS "Proveedor", subtotal AS "Base Imponible (Q)", iva AS "Crédito Fiscal (Q)",
                monto_ret_isr AS "Ret. ISR (Q)", monto_ret_iva AS "Ret. IVA (Q)", total AS "Total Factura (Q)"
         FROM facturas WHERE empresa_id = %s AND tipo = 'COMPRA' ORDER BY fecha ASC
@@ -1498,7 +1489,7 @@ elif selected_menu == "📑 Libro de Retenciones":
     st.title("📑 Libro de Retenciones Practicadas y Recibidas")
     conn = get_db_connection()
     df_r = pd.read_sql_query("""
-        SELECT tipo AS "Operación", fecha AS "Fecha", numero_factura AS "Documento", tercero_nombre AS "Tercero", 
+        SELECT tipo AS "Operación", fecha AS "Fecha", numero_factura AS "Documento",欺tercero_nombre AS "Tercero", 
                subtotal AS "Base (Q)", monto_ret_isr AS "Retención ISR (Q)", monto_ret_iva AS "Retención IVA (Q)" 
         FROM facturas WHERE empresa_id = %s AND (monto_ret_isr > 0 OR monto_ret_iva > 0) ORDER BY fecha DESC
     """, conn, params=(selected_emp_id,))
@@ -1695,24 +1686,181 @@ elif selected_menu == "🏠 Despensa Familiar (Cocina)":
                     st.rerun()
 
 # ==========================================
-# 12. NOMENCLATURA, USUARIOS Y EMPRESAS
+# 12. NOMENCLATURA CONTABLE (CORREGIDO PARA AGREGAR)
 # ==========================================
 elif selected_menu == "🗂️ Nomenclatura Contable":
     if not selected_emp_id: st.stop()
-    st.title("🗂️ Nomenclatura Contable")
-    conn = get_db_connection()
-    df_nom = pd.read_sql_query("SELECT codigo AS \"Código\", nombre AS \"Cuenta\", tipo AS \"Tipo\" FROM nomenclatura WHERE empresa_id = %s ORDER BY codigo", conn, params=(selected_emp_id,))
-    conn.close()
-    st.dataframe(df_nom, use_container_width=True)
+    st.title(f"🗂️ Nomenclatura Contable — {selected_empresa_info[1]}")
 
+    with st.expander("➕ Crear Nueva Cuenta Contable", expanded=True):
+        with st.form("form_cta_nom", clear_on_submit=True):
+            c1, c2, c3 = st.columns(3)
+            cod_c = c1.text_input("Código de Cuenta * (ej: 5.1.02.15)")
+            nom_c = c2.text_input("Nombre de Cuenta * (ej: Papelería y Útiles)")
+            tip_c = c3.selectbox("Tipo de Cuenta *", ["Activo", "Pasivo", "Capital", "Ingreso", "Costo", "Gasto"])
+            
+            if st.form_submit_button("✅ Guardar Cuenta Contable", type="primary"):
+                if cod_c.strip() and nom_c.strip():
+                    conn = get_db_connection()
+                    c = conn.cursor()
+                    try:
+                        c_id = f"nom-{selected_emp_id}-{cod_c.strip()}"
+                        # Elimina si existía previamente con ese código y empresa para evitar bloqueos
+                        c.execute("DELETE FROM nomenclatura WHERE empresa_id = %s AND codigo = %s", (selected_emp_id, cod_c.strip()))
+                        c.execute("""
+                            INSERT INTO nomenclatura (id, empresa_id, codigo, nombre, tipo)
+                            VALUES (%s, %s, %s, %s, %s)
+                        """, (c_id, selected_emp_id, cod_c.strip(), nom_c.strip(), tip_c))
+                        conn.commit()
+                        st.success(f"Cuenta contable '{cod_c.strip()} - {nom_c.strip()}' guardada exitosamente.")
+                        st.rerun()
+                    except Exception as err:
+                        st.error(f"Error al registrar cuenta contable: {err}")
+                    finally:
+                        conn.close()
+                else:
+                    st.error("Por favor completa el Código y el Nombre de la cuenta.")
+
+    conn = get_db_connection()
+    df_nom = pd.read_sql_query("""
+        SELECT codigo AS "Código", nombre AS "Nombre de la Cuenta", tipo AS "Tipo de Saldo" 
+        FROM nomenclatura WHERE empresa_id = %s ORDER BY codigo ASC
+    """, conn, params=(selected_emp_id,))
+    conn.close()
+
+    if df_nom.empty:
+        st.info("No hay cuentas contables registradas para esta empresa.")
+    else:
+        st.dataframe(df_nom, use_container_width=True)
+
+# ==========================================
+# 13. CONTROL DE USUARIOS (CREAR Y VISUALIZAR)
+# ==========================================
 elif selected_menu == "👥 Control de Usuarios (Admin)":
     if not is_admin: st.stop()
-    st.title("👥 Control de Operadores")
+    st.title("👥 Control de Operadores y Asignación de Empresas")
+    
     conn = get_db_connection()
-    df_u = pd.read_sql_query("SELECT username AS \"Usuario\", name AS \"Nombre\", email AS \"Correo\", role AS \"Rol\", status AS \"Estado\" FROM users ORDER BY username", conn)
+    c = conn.cursor()
+    c.execute("SELECT id, username, name, email, role, status, assigned_empresas FROM users WHERE role != 'admin' ORDER BY name ASC")
+    users_list = c.fetchall()
+    c.execute("SELECT id, nombre, nit FROM empresas ORDER BY nombre ASC")
+    all_emps = c.fetchall()
     conn.close()
-    st.dataframe(df_u, use_container_width=True)
 
+    dict_emps_lookup = {e[0]: f"{e[1]} (NIT: {e[2]})" for e in all_emps}
+
+    tab_crear_u, tab_ver_u = st.tabs(["➕ Crear Nuevo Usuario", "📋 Directorio de Usuarios y Accesos"])
+
+    with tab_crear_u:
+        with st.form("form_crear_operador", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            u_user = c1.text_input("Usuario (ej: operador1) *")
+            u_nombre = c2.text_input("Nombre Completo *")
+
+            c3, c4 = st.columns(2)
+            u_email = c3.text_input("Correo Electrónico")
+            u_pass = c4.text_input("Contraseña de Acceso *", type="password")
+
+            rol_opcion = st.selectbox("Perfil / Rol de Acceso:", ["Operador (Solo Registra Facturas)", "Supervisor (Auditoría y Reportes)"])
+            rol_final = "supervisor" if "Supervisor" in rol_opcion else "operator"
+
+            st.markdown("##### 🏢 Empresas Autorizadas para este Usuario:")
+            empresas_seleccionadas = []
+            for emp in all_emps:
+                if st.checkbox(f"{emp[1]} (NIT: {emp[2]})", key=f"new_emp_{emp[0]}", value=True):
+                    empresas_seleccionadas.append(emp[0])
+
+            if st.form_submit_button("✅ Crear y Activar Usuario", type="primary"):
+                if u_user.strip() and u_nombre.strip() and u_pass.strip():
+                    conn = get_db_connection()
+                    c = conn.cursor()
+                    try:
+                        assigned_txt = ",".join(empresas_seleccionadas) if empresas_seleccionadas else "none"
+                        uid = f"usr-{int(datetime.now().timestamp())}"
+                        
+                        # Manejo seguro en PostgreSQL
+                        c.execute("""
+                            INSERT INTO users (id, username, password_hash, name, email, role, status, assigned_empresas, created_at, reset_requested)
+                            VALUES (%s, %s, %s, %s, %s, %s, 'active', %s, %s, 0)
+                            ON CONFLICT (username) DO UPDATE SET 
+                                password_hash = EXCLUDED.password_hash,
+                                name = EXCLUDED.name,
+                                email = EXCLUDED.email,
+                                role = EXCLUDED.role,
+                                status = 'active',
+                                assigned_empresas = EXCLUDED.assigned_empresas
+                        """, (uid, u_user.strip().lower(), hash_password(u_pass.strip()), u_nombre.strip(), u_email.strip(), rol_final, assigned_txt, datetime.now().isoformat()))
+                        conn.commit()
+                        st.success(f"Usuario '@{u_user.strip()}' creado exitosamente.")
+                        st.rerun()
+                    except Exception as err:
+                        st.error(f"Error al registrar usuario: {err}")
+                    finally:
+                        conn.close()
+                else:
+                    st.error("Por favor completa el Usuario, Nombre y Contraseña.")
+
+    with tab_ver_u:
+        st.subheader("📋 Usuarios Registrados y Permisos")
+        if not users_list:
+            st.info("No hay usuarios operadores registrados aún.")
+        else:
+            for u in users_list:
+                uid, uname, name, email, role, status, assigned = u
+                with st.expander(f"👤 {name} (@{uname}) — Rol: {role.upper()}", expanded=False):
+                    col1, col2 = st.columns([1.5, 2])
+                    
+                    with col1:
+                        st.write(f"**Usuario:** `{uname}`")
+                        st.write(f"**Nombre:** {name}")
+                        st.write(f"**Correo:** {email or 'Sin correo registrado'}")
+                        st.write(f"**Rol actual:** `{role.upper()}`")
+                        st.write(f"**Estado de cuenta:** `{status}`")
+                        
+                        nueva_clave = st.text_input(f"Nueva clave para @{uname}:", type="password", key=f"pwd_{uid}")
+                        if st.button(f"🔑 Cambiar Clave", key=f"btn_pwd_{uid}"):
+                            if nueva_clave.strip():
+                                conn = get_db_connection()
+                                c = conn.cursor()
+                                c.execute("UPDATE users SET password_hash = %s WHERE id = %s", (hash_password(nueva_clave.strip()), uid))
+                                conn.commit()
+                                conn.close()
+                                st.success(f"Contraseña de @{uname} actualizada.")
+                            else:
+                                st.error("Ingresa una contraseña válida.")
+
+                    with col2:
+                        st.markdown("**🏢 Empresas Autorizadas:**")
+                        ids_asig = [x.strip() for x in (assigned or "").split(",") if x.strip()]
+                        if assigned == "all":
+                            st.info("Acceso Total (Todas las empresas).")
+                        elif not ids_asig or assigned == "none":
+                            st.warning("⚠️ Sin empresas asignadas.")
+                        else:
+                            for eid in ids_asig:
+                                st.markdown(f"- 🏢 **{dict_emps_lookup.get(eid, 'Empresa eliminada')}**")
+
+                        st.markdown("---")
+                        st.caption("Modificar empresas asignadas:")
+                        nuevos_accesos = []
+                        for emp in all_emps:
+                            tiene = emp[0] in ids_asig or assigned == "all"
+                            if st.checkbox(f"{emp[1]} (NIT: {emp[2]})", value=tiene, key=f"chk_{uid}_{emp[0]}"):
+                                nuevos_accesos.append(emp[0])
+
+                        if st.button(f"💾 Guardar Permisos para @{uname}", key=f"btn_save_{uid}"):
+                            conn = get_db_connection()
+                            c = conn.cursor()
+                            c.execute("UPDATE users SET assigned_empresas = %s WHERE id = %s", (",".join(nuevos_accesos), uid))
+                            conn.commit()
+                            conn.close()
+                            st.success("Permisos de empresa actualizados.")
+                            st.rerun()
+
+# ==========================================
+# 14. GESTIÓN DE EMPRESAS (ADMIN)
+# ==========================================
 elif selected_menu == "🏢 Gestión de Empresas (Admin)":
     if not is_admin: st.stop()
     st.title("🏢 Registro y Consulta de Empresas")
