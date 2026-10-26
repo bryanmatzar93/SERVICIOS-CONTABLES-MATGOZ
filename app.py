@@ -152,77 +152,24 @@ def show_login():
         u = st.text_input("Usuario")
         p = st.text_input("Contraseña", type="password")
         if st.button("Iniciar Sesión", type="primary", use_container_width=True):
-            user_clean = u.strip().lower()
-            pass_clean = p.strip()
-            
             conn = get_db_connection()
             c = conn.cursor()
-            
-            # 1. Consulta el usuario
-            c.execute("SELECT id, username, name, email, role, status, assigned_empresas, password_hash FROM users WHERE LOWER(username) = %s", (user_clean,))
+            c.execute("SELECT id, username, name, email, role, status, assigned_empresas FROM users WHERE username = %s AND password_hash = %s", (u, hash_password(p)))
             row = c.fetchone()
-            
-            # Validación con contraseña de Supabase o claves maestras autorizadas
-            claves_admin_validas = ["Matgozmaster2026JGK", "admin123", "Matgozmaster2026#"]
-            
+            conn.close()
             if row:
-                hash_guardado = row[7]
-                es_valido = (hash_guardado == hash_password(pass_clean)) or (user_clean == "admin" and pass_clean in claves_admin_validas)
-                
-                if es_valido:
-                    # Actualizar hash en Supabase si entró con clave maestra
-                    if user_clean == "admin" and hash_guardado != hash_password(pass_clean):
-                        try:
-                            c.execute("UPDATE users SET password_hash = %s WHERE id = %s", (hash_password(pass_clean), row[0]))
-                            conn.commit()
-                        except Exception:
-                            pass
-                    
-                    conn.close()
-                    if row[5] == "pending_approval":
-                        st.warning("Cuenta pendiente de autorización.")
-                    elif row[5] == "suspended":
-                        st.error("Cuenta suspendida.")
-                    else:
-                        st.session_state.user = {
-                            "id": row[0],
-                            "username": row[1],
-                            "name": row[2],
-                            "email": row[3],
-                            "role": row[4],
-                            "assigned_empresas": row[6]
-                        }
-                        st.rerun()
+                if row[5] == "pending_approval":
+                    st.warning("Cuenta pendiente de autorización.")
                 else:
-                    conn.close()
-                    st.error("Credenciales incorrectas.")
+                    st.session_state.user = {"id": row[0], "username": row[1], "name": row[2], "email": row[3], "role": row[4], "assigned_empresas": row[6]}
+                    st.rerun()
             else:
-                # Si por algún motivo el usuario admin no estuviera en la tabla, lo crea de emergencia
-                if user_clean == "admin" and pass_clean in claves_admin_validas:
-                    try:
-                        admin_id = f"usr-admin"
-                        c.execute("""
-                            INSERT INTO users (id, username, password_hash, name, email, role, status, assigned_empresas, created_at, reset_requested)
-                            VALUES (%s, 'admin', %s, 'Administrador Principal', 'admin@matgoz.com', 'admin', 'active', 'all', %s, 0)
-                            ON CONFLICT (username) DO UPDATE SET password_hash = %s, status = 'active'
-                        """, (admin_id, hash_password(pass_clean), datetime.now().isoformat(), hash_password(pass_clean)))
-                        conn.commit()
-                        conn.close()
-                        st.session_state.user = {
-                            "id": admin_id,
-                            "username": "admin",
-                            "name": "Administrador Principal",
-                            "email": "admin@matgoz.com",
-                            "role": "admin",
-                            "assigned_empresas": "all"
-                        }
-                        st.rerun()
-                    except Exception as e_login:
-                        conn.close()
-                        st.error(f"Error de acceso: {e_login}")
-                else:
-                    conn.close()
-                    st.error("Credenciales incorrectas.")
+                st.error("Credenciales incorrectas.")
+
+if not st.session_state.user:
+    show_login()
+    st.stop()
+
 # ==========================================
 # SIDEBAR Y EMPRESA ACTIVA
 # ==========================================
@@ -671,7 +618,7 @@ elif selected_menu == "📈 Factura de Ventas":
         partida_v = [
             {"Cuenta": cta_debe_v, "DEBE": f"Q {liq:,.2f}", "HABER": "Q 0.00"},
         ]
-        if m_isr > 0: partida_v.append({"Cuenta": "1.1.03.02 - ISR Retenido por Acreditar", "DEBE": f"Q {m_isr:,.2f}", "HABER": "Q 0.00"})
+        if m_isr > 0: partida_v.append({"Cuenta": "1.1.03.02 - ISR Retenido por Acreditar", "DEBE": f"Q {m_isr:,.2f}", "HABER": "Q 0.00"},)
         if m_iva > 0: partida_v.append({"Cuenta": "1.1.03.03 - Constancias Retención IVA", "DEBE": f"Q {m_iva:,.2f}", "HABER": "Q 0.00"})
         partida_v.append({"Cuenta": cta_haber_v, "DEBE": "Q 0.00", "HABER": f"Q {subtotal:,.2f}"})
         partida_v.append({"Cuenta": "2.1.02.01 - IVA por Pagar (Débito Fiscal)", "DEBE": "Q 0.00", "HABER": f"Q {iva:,.2f}"})
@@ -719,7 +666,7 @@ elif selected_menu == "💳 Cuentas por Pagar (Proveedores)":
     if not selected_emp_id: st.stop()
     st.title("💳 Control de Cuentas por Pagar (CXP)")
     conn = get_db_connection()
-    df_cxp = pd.read_sql_query("""SELECT id, fecha, numero_factura,欺 tercero_nombre, total, saldo_pendiente
+    df_cxp = pd.read_sql_query("""SELECT id, fecha, numero_factura, tercero_nombre, total, saldo_pendiente
                                   FROM facturas WHERE empresa_id = %s AND tipo = 'COMPRA' AND estado_pago = 'PENDIENTE'""", conn, params=(selected_emp_id,))
     
     if df_cxp.empty:
@@ -836,7 +783,7 @@ elif selected_menu == "📋 Libro de Compras (SAT)":
     st.title(f"📋 Libro de Compras Tributario — {selected_empresa_info[1]}")
     conn = get_db_connection()
     df_compras_sat = pd.read_sql_query("""
-        SELECT fecha AS "Fecha", serie AS "Serie", numero_factura AS "Factura", tercero_nit AS "NIT Proveedor",
+        SELECT fecha AS "Fecha", serie AS "Serie", numero_factura AS "Factura",欺tercero_nit AS "NIT Proveedor",
                tercero_nombre AS "Proveedor", subtotal AS "Base Imponible (Q)", iva AS "Crédito Fiscal (Q)",
                monto_ret_isr AS "Ret. ISR (Q)", monto_ret_iva AS "Ret. IVA (Q)", total AS "Total Factura (Q)"
         FROM facturas WHERE empresa_id = %s AND tipo = 'COMPRA' ORDER BY fecha ASC
