@@ -56,6 +56,21 @@ def inicializar_tablas_sistema():
         conn = get_db_connection()
         c = conn.cursor()
         c.execute("""
+            CREATE TABLE IF NOT EXISTS libro_diario (
+                id SERIAL PRIMARY KEY,
+                empresa_id TEXT NOT NULL,
+                partida_no INTEGER NOT NULL,
+                fecha DATE NOT NULL,
+                codigo_cuenta TEXT NOT NULL,
+                nombre_cuenta TEXT NOT NULL,
+                debe NUMERIC DEFAULT 0,
+                haber NUMERIC DEFAULT 0,
+                concepto TEXT,
+                documento_ref TEXT,
+                created_at TEXT
+            );
+        """)
+        c.execute("""
             CREATE TABLE IF NOT EXISTS despensa_articulos (
                 id TEXT PRIMARY KEY,
                 nombre TEXT NOT NULL UNIQUE,
@@ -101,19 +116,6 @@ def inicializar_tablas_sistema():
                 direccion TEXT,
                 telefono TEXT,
                 dias_credito INT DEFAULT 0
-            );
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS activos_fijos (
-                id TEXT PRIMARY KEY,
-                empresa_id TEXT NOT NULL,
-                factura_id TEXT,
-                codigo_activo TEXT,
-                descripcion TEXT NOT NULL,
-                categoria TEXT NOT NULL,
-                fecha_adquisicion DATE NOT NULL,
-                costo_adquisicion NUMERIC NOT NULL,
-                created_at TEXT
             );
         """)
         c.execute("""
@@ -520,7 +522,7 @@ if selected_menu == "📊 Resumen General":
     c4.metric("💰 Cuentas por Cobrar (CXC)", f"Q {float(cxc_tot):,.2f}")
 
 # ==========================================
-# 2. FACTURA DE VENTAS
+# 2. FACTURA DE VENTAS (MONTO TOTAL)
 # ==========================================
 elif selected_menu == "📈 Factura de Ventas":
     if not selected_emp_id: st.stop()
@@ -601,11 +603,11 @@ elif selected_menu == "📈 Factura de Ventas":
             es_pequeno_v = st.checkbox("¿Régimen Pequeño Contribuyente? (No genera débito fiscal IVA)", value=pre_v.get("es_pequeno", False), key=f"v_peq_{fk_v}")
 
             if es_pequeno_v:
-                subtotal_v = total_factura_v
+                subtotal_v = float(total_factura_v)
                 iva_v = 0.0
             else:
-                subtotal_v = round(total_factura_v / 1.12, 2)
-                iva_v = round(total_factura_v - subtotal_v, 2)
+                subtotal_v = round(float(total_factura_v) / 1.12, 2)
+                iva_v = round(float(total_factura_v) - subtotal_v, 2)
 
             r1, r2 = st.columns(2)
             aplica_isr_v = r1.checkbox("Cliente practicó Retención de ISR", value=False, key=f"v_rk_{fk_v}")
@@ -621,7 +623,7 @@ elif selected_menu == "📈 Factura de Ventas":
             if aplica_iva_v and tipo_iva_v != "No Aplica / No es Agente Retenedor":
                 m_iva_v = round(iva_v * 0.15, 2) if "15%" in tipo_iva_v else round(iva_v, 2)
 
-            liq_v = round(total_factura_v - m_isr_v - m_iva_v, 2)
+            liq_v = round(float(total_factura_v) - m_isr_v - m_iva_v, 2)
 
             st.caption(f"Base Imponible: **Q {subtotal_v:,.2f}** | IVA Débito Fiscal: **Q {iva_v:,.2f}** | Líquido a Recibir: **Q {liq_v:,.2f}**")
 
@@ -637,7 +639,7 @@ elif selected_menu == "📈 Factura de Ventas":
                     conn = get_db_connection()
                     c = conn.cursor()
                     fac_id = f"fac-v-{int(datetime.now().timestamp())}"
-                    saldo = liq_v if cond_v == "Crédito" else 0.0
+                    saldo = float(liq_v) if cond_v == "Crédito" else 0.0
                     estado = "PENDIENTE" if cond_v == "Crédito" else "PAGADO"
                     fp_desc = cond_v if cond_v == "Crédito" else f"Contado ({metodo_v})"
 
@@ -645,23 +647,32 @@ elif selected_menu == "📈 Factura de Ventas":
                         INSERT INTO facturas VALUES (%s, %s, 'VENTA', %s, %s, %s, %s, %s, 'Venta', 'Ingreso',
                                      %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """, (fac_id, selected_emp_id, num_fac, serie, str(fecha_fac), cli_nom, cli_nit,
-                          cta_haber_v, cta_debe_v, fp_desc, subtotal_v, iva_v, total_factura_v,
-                          1 if m_isr_v > 0 else 0, 0.05 if m_isr_v > 0 else 0.0, m_isr_v,
-                          1 if m_iva_v > 0 else 0, 0.15 if m_iva_v > 0 else 0.0, m_iva_v,
-                          liq_v, saldo, estado, curr_u['username'], datetime.now().isoformat()))
+                          cta_haber_v, cta_debe_v, fp_desc, float(subtotal_v), float(iva_v), float(total_factura_v),
+                          1 if m_isr_v > 0 else 0, 0.05 if m_isr_v > 0 else 0.0, float(m_isr_v),
+                          1 if m_iva_v > 0 else 0, 0.15 if m_iva_v > 0 else 0.0, float(m_iva_v),
+                          float(liq_v), saldo, estado, curr_u['username'], datetime.now().isoformat()))
 
                     c.execute("SELECT COALESCE(MAX(partida_no), 0) + 1 FROM libro_diario WHERE empresa_id = %s", (selected_emp_id,))
-                    p_no = c.fetchone()[0]
+                    p_no = int(c.fetchone()[0] or 1)
                     now_str = datetime.now().isoformat()
                     glosa = f"Factura Venta {num_fac} a {cli_nom}"
 
                     cod_d, nom_d = cta_debe_v.split(" - ", 1)
                     cod_h, nom_h = cta_haber_v.split(" - ", 1)
-                    c.execute("INSERT INTO libro_diario VALUES (DEFAULT, %s, %s, %s, %s, %s, %s, 0, %s, %s, %s)", (selected_emp_id, p_no, str(fecha_fac), cod_d, nom_d, liq_v, glosa, num_fac, now_str))
-                    if m_isr_v > 0: c.execute("INSERT INTO libro_diario VALUES (DEFAULT, %s, %s, %s, '1.1.03.02', 'ISR Retenido por Acreditar', %s, 0, %s, %s, %s)", (selected_emp_id, p_no, str(fecha_fac), m_isr_v, glosa, num_fac, now_str))
-                    if m_iva_v > 0: c.execute("INSERT INTO libro_diario VALUES (DEFAULT, %s, %s, %s, '1.1.03.03', 'Constancias Retención IVA', %s, 0, %s, %s, %s)", (selected_emp_id, p_no, str(fecha_fac), m_iva_v, glosa, num_fac, now_str))
-                    c.execute("INSERT INTO libro_diario VALUES (DEFAULT, %s, %s, %s, %s, %s, 0, %s, %s, %s)", (selected_emp_id, p_no, str(fecha_fac), cod_h, nom_h, subtotal_v, glosa, num_fac, now_str))
-                    if iva_v > 0: c.execute("INSERT INTO libro_diario VALUES (DEFAULT, %s, %s, %s, '2.1.02.01', 'IVA por Pagar', 0, %s, %s, %s, %s)", (selected_emp_id, p_no, str(fecha_fac), iva_v, glosa, num_fac, now_str))
+
+                    # Inserción segura en libro_diario
+                    q_ins_ld = """
+                        INSERT INTO libro_diario (empresa_id, partida_no, fecha, codigo_cuenta, nombre_cuenta, debe, haber, concepto, documento_ref, created_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """
+                    c.execute(q_ins_ld, (selected_emp_id, p_no, str(fecha_fac), cod_d, nom_d, float(liq_v), 0.0, glosa, num_fac, now_str))
+                    if m_isr_v > 0:
+                        c.execute(q_ins_ld, (selected_emp_id, p_no, str(fecha_fac), '1.1.03.02', 'ISR Retenido por Acreditar', float(m_isr_v), 0.0, glosa, num_fac, now_str))
+                    if m_iva_v > 0:
+                        c.execute(q_ins_ld, (selected_emp_id, p_no, str(fecha_fac), '1.1.03.03', 'Constancias Retención IVA', float(m_iva_v), 0.0, glosa, num_fac, now_str))
+                    c.execute(q_ins_ld, (selected_emp_id, p_no, str(fecha_fac), cod_h, nom_h, 0.0, float(subtotal_v), glosa, num_fac, now_str))
+                    if iva_v > 0:
+                        c.execute(q_ins_ld, (selected_emp_id, p_no, str(fecha_fac), '2.1.02.01', 'IVA por Pagar', 0.0, float(iva_v), glosa, num_fac, now_str))
 
                     try:
                         c.execute("""
@@ -676,6 +687,8 @@ elif selected_menu == "📈 Factura de Ventas":
                     conn.close()
                     st.success("Factura de venta emitida exitosamente.")
                     st.rerun()
+                else:
+                    st.error("Completa el número de factura, cliente, NIT y total.")
 
     with tab_v_editar:
         st.subheader("✏️ Modificar o Eliminar Factura de Venta")
@@ -818,12 +831,12 @@ elif selected_menu == "🛒 Factura de Compras":
 
             if tipo_doc_compra == "Factura Electrónica FEL (SAT)":
                 es_peq_prov = st.checkbox("¿Factura de Pequeño Contribuyente? (No genera crédito fiscal IVA)", value=pre_c.get("es_pequeno", False), key=f"c_peq_{fk_c}")
-                iva_compra = 0.0 if es_peq_prov else round(subtotal_compra * 0.12, 2)
-                total_compra = round(subtotal_compra + iva_compra, 2)
+                iva_compra = 0.0 if es_peq_prov else round(float(subtotal_compra) * 0.12, 2)
+                total_compra = round(float(subtotal_compra) + iva_compra, 2)
             else:
                 es_peq_prov = False
                 iva_compra = 0.0
-                total_compra = subtotal_compra
+                total_compra = float(subtotal_compra)
 
             r1, r2 = st.columns(2)
             aplica_isr_c = r1.checkbox("Practicar Retención ISR", value=(subtotal_compra >= 2800.0 and tipo_doc_compra == "Factura Electrónica FEL (SAT)"), key=f"c_rk_{fk_c}")
@@ -833,13 +846,13 @@ elif selected_menu == "🛒 Factura de Compras":
 
             m_isr_c = 0.0
             if aplica_isr_c and subtotal_compra >= 2800.0 and tipo_isr_c != "No Aplica":
-                m_isr_c = round(subtotal_compra * 0.05, 2) if tipo_isr_c == "5% General" else round(1500.0 + (subtotal_compra - 30000.0) * 0.07, 2)
+                m_isr_c = round(float(subtotal_compra) * 0.05, 2) if tipo_isr_c == "5% General" else round(1500.0 + (float(subtotal_compra) - 30000.0) * 0.07, 2)
 
             m_iva_c = 0.0
             if aplica_iva_c and tipo_iva_c != "No Aplica / No es Agente Retenedor":
                 m_iva_c = round(iva_compra * 0.15, 2) if "15%" in tipo_iva_c else round(iva_compra, 2)
 
-            liq_c = round(total_compra - m_isr_c - m_iva_c, 2)
+            liq_c = round(float(total_compra) - m_isr_c - m_iva_c, 2)
 
             partida_c = [{"Cuenta": cta_debe, "DEBE": f"Q {subtotal_compra:,.2f}", "HABER": "Q 0.00"}]
             if iva_compra > 0: partida_c.append({"Cuenta": "1.1.03.01 - IVA por Cobrar (Crédito)", "DEBE": f"Q {iva_compra:,.2f}", "HABER": "Q 0.00"})
@@ -853,7 +866,7 @@ elif selected_menu == "🛒 Factura de Compras":
                     conn = get_db_connection()
                     c = conn.cursor()
                     fac_id = f"fac-c-{int(datetime.now().timestamp())}"
-                    saldo = liq_c if cond_pago == "Crédito" else 0.0
+                    saldo = float(liq_c) if cond_pago == "Crédito" else 0.0
                     estado = "PENDIENTE" if cond_pago == "Crédito" else "PAGADO"
                     fp_desc = cond_pago if cond_pago == "Crédito" else f"Contado ({metodo_p})"
 
@@ -861,29 +874,37 @@ elif selected_menu == "🛒 Factura de Compras":
                         INSERT INTO facturas VALUES (%s, %s, 'COMPRA', %s, %s, %s, %s, %s, %s, %s,
                                      %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """, (fac_id, selected_emp_id, num_fac, serie, str(fecha_fac), prov_nom, prov_nit,
-                          cta_debe, cta_haber, fp_desc, subtotal_compra, iva_compra, total_compra,
-                          1 if m_isr_c > 0 else 0, 0.05 if m_isr_c > 0 else 0.0, m_isr_c,
-                          1 if m_iva_c > 0 else 0, 0.15 if m_iva_c > 0 else 0.0, m_iva_c,
-                          liq_c, saldo, estado, curr_u['username'], datetime.now().isoformat()))
+                          cta_debe, cta_haber, fp_desc, float(subtotal_compra), float(iva_compra), float(total_compra),
+                          1 if m_isr_c > 0 else 0, 0.05 if m_isr_c > 0 else 0.0, float(m_isr_c),
+                          1 if m_iva_c > 0 else 0, 0.15 if m_iva_c > 0 else 0.0, float(m_iva_c),
+                          float(liq_c), saldo, estado, curr_u['username'], datetime.now().isoformat()))
 
                     c.execute("SELECT COALESCE(MAX(partida_no), 0) + 1 FROM libro_diario WHERE empresa_id = %s", (selected_emp_id,))
-                    p_no = c.fetchone()[0]
+                    p_no = int(c.fetchone()[0] or 1)
                     now_str = datetime.now().isoformat()
                     glosa = f"{'Factura Compra' if tipo_doc_compra == 'Factura Electrónica FEL (SAT)' else 'Comprobante No Fiscal'} {num_fac} de {prov_nom}"
 
                     cod_d, nom_d = cta_debe.split(" - ", 1)
                     cod_h, nom_h = cta_haber.split(" - ", 1)
-                    c.execute("INSERT INTO libro_diario VALUES (DEFAULT, %s, %s, %s, %s, %s, %s, 0, %s, %s, %s)", (selected_emp_id, p_no, str(fecha_fac), cod_d, nom_d, subtotal_compra, glosa, num_fac, now_str))
-                    if iva_compra > 0: c.execute("INSERT INTO libro_diario VALUES (DEFAULT, %s, %s, %s, '1.1.03.01', 'IVA por Cobrar', %s, 0, %s, %s, %s)", (selected_emp_id, p_no, str(fecha_fac), iva_compra, glosa, num_fac, now_str))
-                    if m_isr_c > 0: c.execute("INSERT INTO libro_diario VALUES (DEFAULT, %s, %s, %s, '2.1.03.01', 'Retenciones ISR por Pagar', 0, %s, %s, %s, %s)", (selected_emp_id, p_no, str(fecha_fac), m_isr_c, glosa, num_fac, now_str))
-                    if m_iva_c > 0: c.execute("INSERT INTO libro_diario VALUES (DEFAULT, %s, %s, %s, '2.1.03.02', 'Retenciones IVA por Pagar', 0, %s, %s, %s, %s)", (selected_emp_id, p_no, str(fecha_fac), m_iva_c, glosa, num_fac, now_str))
-                    c.execute("INSERT INTO libro_diario VALUES (DEFAULT, %s, %s, %s, %s, %s, 0, %s, %s, %s)", (selected_emp_id, p_no, str(fecha_fac), cod_h, nom_h, liq_c, glosa, num_fac, now_str))
+
+                    q_ins_ld = """
+                        INSERT INTO libro_diario (empresa_id, partida_no, fecha, codigo_cuenta, nombre_cuenta, debe, haber, concepto, documento_ref, created_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """
+                    c.execute(q_ins_ld, (selected_emp_id, p_no, str(fecha_fac), cod_d, nom_d, float(subtotal_compra), 0.0, glosa, num_fac, now_str))
+                    if iva_compra > 0:
+                        c.execute(q_ins_ld, (selected_emp_id, p_no, str(fecha_fac), '1.1.03.01', 'IVA por Cobrar', float(iva_compra), 0.0, glosa, num_fac, now_str))
+                    if m_isr_c > 0:
+                        c.execute(q_ins_ld, (selected_emp_id, p_no, str(fecha_fac), '2.1.03.01', 'Retenciones ISR por Pagar', 0.0, float(m_isr_c), glosa, num_fac, now_str))
+                    if m_iva_c > 0:
+                        c.execute(q_ins_ld, (selected_emp_id, p_no, str(fecha_fac), '2.1.03.02', 'Retenciones IVA por Pagar', 0.0, float(m_iva_c), glosa, num_fac, now_str))
+                    c.execute(q_ins_ld, (selected_emp_id, p_no, str(fecha_fac), cod_h, nom_h, 0.0, float(liq_c), glosa, num_fac, now_str))
 
                     if destino_bien == "Activo Fijo / No Corriente":
                         c.execute("""
                             INSERT INTO activos_fijos (id, empresa_id, factura_id, codigo_activo, descripcion, categoria, fecha_adquisicion, costo_adquisicion, created_at)
                             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        """, (f"act-{int(datetime.now().timestamp())}", selected_emp_id, fac_id, num_fac, f"Adquisición {prov_nom}", "Mobiliario y Equipo", str(fecha_fac), subtotal_compra, now_str))
+                        """, (f"act-{int(datetime.now().timestamp())}", selected_emp_id, fac_id, num_fac, f"Adquisición {prov_nom}", "Mobiliario y Equipo", str(fecha_fac), float(subtotal_compra), now_str))
 
                     try:
                         c.execute("""
@@ -975,7 +996,7 @@ elif selected_menu == "📦 Control de Inventarios (Kárdex)":
                         c.execute("""
                             INSERT INTO productos (id, empresa_id, codigo, descripcion, existencia, costo_promedio, precio_venta, created_at)
                             VALUES (%s, 'CORP', %s, %s, 0, 0, %s, %s)
-                        """, (p_id, p_cod.strip(), p_nom.strip(), p_pre, datetime.now().isoformat()))
+                        """, (p_id, p_cod.strip(), p_nom.strip(), float(p_pre), datetime.now().isoformat()))
                         conn.commit()
                         st.success(f"Artículo '{p_nom}' guardado a nivel corporativo.")
                         st.rerun()
@@ -1396,7 +1417,7 @@ elif selected_menu == "📋 Libro de Compras (SAT)":
     st.title(f"📋 Libro de Compras Tributario — {selected_empresa_info[1]}")
     conn = get_db_connection()
     df_compras_sat = pd.read_sql_query("""
-        SELECT fecha AS "Fecha", serie AS "Serie", numero_factura AS "Factura",欺tercero_nit AS "NIT Proveedor",
+        SELECT fecha AS "Fecha", serie AS "Serie", numero_factura AS "Factura", tercero_nit AS "NIT Proveedor",
                tercero_nombre AS "Proveedor", subtotal AS "Base Imponible (Q)", iva AS "Crédito Fiscal (Q)",
                monto_ret_isr AS "Ret. ISR (Q)", monto_ret_iva AS "Ret. IVA (Q)", total AS "Total Factura (Q)"
         FROM facturas WHERE empresa_id = %s AND tipo = 'COMPRA' ORDER BY fecha ASC
@@ -1489,7 +1510,7 @@ elif selected_menu == "📑 Libro de Retenciones":
     st.title("📑 Libro de Retenciones Practicadas y Recibidas")
     conn = get_db_connection()
     df_r = pd.read_sql_query("""
-        SELECT tipo AS "Operación", fecha AS "Fecha", numero_factura AS "Documento",欺tercero_nombre AS "Tercero", 
+        SELECT tipo AS "Operación", fecha AS "Fecha", numero_factura AS "Documento", tercero_nombre AS "Tercero", 
                subtotal AS "Base (Q)", monto_ret_isr AS "Retención ISR (Q)", monto_ret_iva AS "Retención IVA (Q)" 
         FROM facturas WHERE empresa_id = %s AND (monto_ret_isr > 0 OR monto_ret_iva > 0) ORDER BY fecha DESC
     """, conn, params=(selected_emp_id,))
@@ -1523,16 +1544,20 @@ elif selected_menu == "💳 Cuentas por Pagar (Proveedores)":
                 if monto_abono > row_f['saldo_pendiente']:
                     st.error("El abono no puede superar el saldo pendiente.")
                 else:
-                    nuevo_saldo = round(row_f['saldo_pendiente'] - monto_abono, 2)
+                    nuevo_saldo = round(float(row_f['saldo_pendiente']) - float(monto_abono), 2)
                     nuevo_estado = "PAGADO" if nuevo_saldo <= 0 else "PENDIENTE"
                     c = conn.cursor()
                     c.execute("UPDATE facturas SET saldo_pendiente = %s, estado_pago = %s WHERE id = %s", (nuevo_saldo, nuevo_estado, fac_sel))
                     c.execute("SELECT COALESCE(MAX(partida_no), 0) + 1 FROM libro_diario WHERE empresa_id = %s", (selected_emp_id,))
-                    p_no = c.fetchone()[0]
-                    c.execute("INSERT INTO libro_diario VALUES (DEFAULT, %s, %s, %s, '2.1.01.01', 'Proveedores / Cuentas por Pagar', %s, 0, %s, %s, %s)",
-                              (selected_emp_id, p_no, str(date.today()), monto_abono, f"Abono Fac {row_f['numero_factura']}", row_f['numero_factura'], datetime.now().isoformat()))
-                    c.execute("INSERT INTO libro_diario VALUES (DEFAULT, %s, %s, %s, %s, 'Salida de Fondos', 0, %s, %s, %s, %s)",
-                              (selected_emp_id, p_no, str(date.today()), cta_origen, monto_abono, f"Pago Fac {row_f['numero_factura']}", row_f['numero_factura'], datetime.now().isoformat()))
+                    p_no = int(c.fetchone()[0] or 1)
+                    now_str = datetime.now().isoformat()
+
+                    q_ins_ld = """
+                        INSERT INTO libro_diario (empresa_id, partida_no, fecha, codigo_cuenta, nombre_cuenta, debe, haber, concepto, documento_ref, created_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """
+                    c.execute(q_ins_ld, (selected_emp_id, p_no, str(date.today()), '2.1.01.01', 'Proveedores / Cuentas por Pagar', float(monto_abono), 0.0, f"Abono Fac {row_f['numero_factura']}", row_f['numero_factura'], now_str))
+                    c.execute(q_ins_ld, (selected_emp_id, p_no, str(date.today()), cta_origen, 'Salida de Fondos', 0.0, float(monto_abono), f"Pago Fac {row_f['numero_factura']}", row_f['numero_factura'], now_str))
                     conn.commit()
                     conn.close()
                     st.success("Pago registrado exitosamente.")
@@ -1563,16 +1588,20 @@ elif selected_menu == "💰 Cuentas por Cobrar (Clientes)":
                 if monto_cobro > row_v['saldo_pendiente']:
                     st.error("El cobro no puede superar el saldo pendiente.")
                 else:
-                    nuevo_saldo = round(row_v['saldo_pendiente'] - monto_cobro, 2)
+                    nuevo_saldo = round(float(row_v['saldo_pendiente']) - float(monto_cobro), 2)
                     nuevo_estado = "PAGADO" if nuevo_saldo <= 0 else "PENDIENTE"
                     c = conn.cursor()
                     c.execute("UPDATE facturas SET saldo_pendiente = %s, estado_pago = %s WHERE id = %s", (nuevo_saldo, nuevo_estado, fac_sel))
                     c.execute("SELECT COALESCE(MAX(partida_no), 0) + 1 FROM libro_diario WHERE empresa_id = %s", (selected_emp_id,))
-                    p_no = c.fetchone()[0]
-                    c.execute("INSERT INTO libro_diario VALUES (DEFAULT, %s, %s, %s, %s, 'Ingreso de Fondos', %s, 0, %s, %s, %s)",
-                              (selected_emp_id, p_no, str(date.today()), cta_destino, monto_cobro, f"Cobro Fac {row_v['numero_factura']}", row_v['numero_factura'], datetime.now().isoformat()))
-                    c.execute("INSERT INTO libro_diario VALUES (DEFAULT, %s, %s, %s, '1.1.02.01', 'Clientes / Cuentas por Cobrar', 0, %s, %s, %s, %s)",
-                              (selected_emp_id, p_no, str(date.today()), monto_cobro, f"Cancelación Fac {row_v['numero_factura']}", row_v['numero_factura'], datetime.now().isoformat()))
+                    p_no = int(c.fetchone()[0] or 1)
+                    now_str = datetime.now().isoformat()
+
+                    q_ins_ld = """
+                        INSERT INTO libro_diario (empresa_id, partida_no, fecha, codigo_cuenta, nombre_cuenta, debe, haber, concepto, documento_ref, created_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """
+                    c.execute(q_ins_ld, (selected_emp_id, p_no, str(date.today()), cta_destino, 'Ingreso de Fondos', float(monto_cobro), 0.0, f"Cobro Fac {row_v['numero_factura']}", row_v['numero_factura'], now_str))
+                    c.execute(q_ins_ld, (selected_emp_id, p_no, str(date.today()), '1.1.02.01', 'Clientes / Cuentas por Cobrar', 0.0, float(monto_cobro), f"Cancelación Fac {row_v['numero_factura']}", row_v['numero_factura'], now_str))
                     conn.commit()
                     conn.close()
                     st.success("Cobro registrado y saldos actualizados.")
@@ -1603,7 +1632,7 @@ elif selected_menu == "👥 Directorio Terceros (Clientes/Proveedores)":
                             INSERT INTO terceros (empresa_id, tipo, nit, nombre, direccion, telefono, dias_credito)
                             VALUES (%s, %s, %s, %s, %s, %s, %s)
                             ON CONFLICT (nit) DO UPDATE SET nombre = EXCLUDED.nombre, tipo = EXCLUDED.tipo, direccion = EXCLUDED.direccion
-                        """, (selected_emp_id, t_tipo, t_nit.strip().upper(), t_nom.strip(), t_dir, t_tel, t_dias))
+                        """, (selected_emp_id, t_tipo, t_nit.strip().upper(), t_nom.strip(), t_dir, t_tel, int(t_dias)))
                         conn.commit()
                         st.success(f"Tercero '{t_nom}' registrado corporativamente.")
                         st.rerun()
@@ -1645,7 +1674,7 @@ elif selected_menu == "🏠 Despensa Familiar (Cocina)":
                 if st.form_submit_button("Ingresar a Stock"):
                     conn = get_db_connection()
                     c = conn.cursor()
-                    c.execute("UPDATE despensa_articulos SET stock_actual = stock_actual + %s WHERE id = %s", (cant, opc_d[p_sel]))
+                    c.execute("UPDATE despensa_articulos SET stock_actual = stock_actual + %s WHERE id = %s", (float(cant), opc_d[p_sel]))
                     conn.commit()
                     conn.close()
                     st.success("Stock actualizado.")
@@ -1664,7 +1693,7 @@ elif selected_menu == "🏠 Despensa Familiar (Cocina)":
                     else:
                         conn = get_db_connection()
                         c = conn.cursor()
-                        c.execute("UPDATE despensa_articulos SET stock_actual = stock_actual - %s WHERE id = %s", (cant_r, pid))
+                        c.execute("UPDATE despensa_articulos SET stock_actual = stock_actual - %s WHERE id = %s", (float(cant_r), pid))
                         conn.commit()
                         conn.close()
                         st.success("Rebaja aplicada.")
@@ -1686,7 +1715,7 @@ elif selected_menu == "🏠 Despensa Familiar (Cocina)":
                     st.rerun()
 
 # ==========================================
-# 12. NOMENCLATURA CONTABLE (CORREGIDO PARA AGREGAR)
+# 12. NOMENCLATURA CONTABLE
 # ==========================================
 elif selected_menu == "🗂️ Nomenclatura Contable":
     if not selected_emp_id: st.stop()
@@ -1705,7 +1734,6 @@ elif selected_menu == "🗂️ Nomenclatura Contable":
                     c = conn.cursor()
                     try:
                         c_id = f"nom-{selected_emp_id}-{cod_c.strip()}"
-                        # Elimina si existía previamente con ese código y empresa para evitar bloqueos
                         c.execute("DELETE FROM nomenclatura WHERE empresa_id = %s AND codigo = %s", (selected_emp_id, cod_c.strip()))
                         c.execute("""
                             INSERT INTO nomenclatura (id, empresa_id, codigo, nombre, tipo)
@@ -1779,7 +1807,6 @@ elif selected_menu == "👥 Control de Usuarios (Admin)":
                         assigned_txt = ",".join(empresas_seleccionadas) if empresas_seleccionadas else "none"
                         uid = f"usr-{int(datetime.now().timestamp())}"
                         
-                        # Manejo seguro en PostgreSQL
                         c.execute("""
                             INSERT INTO users (id, username, password_hash, name, email, role, status, assigned_empresas, created_at, reset_requested)
                             VALUES (%s, %s, %s, %s, %s, %s, 'active', %s, %s, 0)
