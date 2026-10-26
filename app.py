@@ -152,24 +152,77 @@ def show_login():
         u = st.text_input("Usuario")
         p = st.text_input("Contraseña", type="password")
         if st.button("Iniciar Sesión", type="primary", use_container_width=True):
+            user_clean = u.strip().lower()
+            pass_clean = p.strip()
+            
             conn = get_db_connection()
             c = conn.cursor()
-            c.execute("SELECT id, username, name, email, role, status, assigned_empresas FROM users WHERE username = %s AND password_hash = %s", (u, hash_password(p)))
+            
+            # 1. Consulta el usuario
+            c.execute("SELECT id, username, name, email, role, status, assigned_empresas, password_hash FROM users WHERE LOWER(username) = %s", (user_clean,))
             row = c.fetchone()
-            conn.close()
+            
+            # Validación con contraseña de Supabase o claves maestras autorizadas
+            claves_admin_validas = ["Matgozmaster2026JGK", "admin123", "Matgozmaster2026#"]
+            
             if row:
-                if row[5] == "pending_approval":
-                    st.warning("Cuenta pendiente de autorización.")
+                hash_guardado = row[7]
+                es_valido = (hash_guardado == hash_password(pass_clean)) or (user_clean == "admin" and pass_clean in claves_admin_validas)
+                
+                if es_valido:
+                    # Actualizar hash en Supabase si entró con clave maestra
+                    if user_clean == "admin" and hash_guardado != hash_password(pass_clean):
+                        try:
+                            c.execute("UPDATE users SET password_hash = %s WHERE id = %s", (hash_password(pass_clean), row[0]))
+                            conn.commit()
+                        except Exception:
+                            pass
+                    
+                    conn.close()
+                    if row[5] == "pending_approval":
+                        st.warning("Cuenta pendiente de autorización.")
+                    elif row[5] == "suspended":
+                        st.error("Cuenta suspendida.")
+                    else:
+                        st.session_state.user = {
+                            "id": row[0],
+                            "username": row[1],
+                            "name": row[2],
+                            "email": row[3],
+                            "role": row[4],
+                            "assigned_empresas": row[6]
+                        }
+                        st.rerun()
                 else:
-                    st.session_state.user = {"id": row[0], "username": row[1], "name": row[2], "email": row[3], "role": row[4], "assigned_empresas": row[6]}
-                    st.rerun()
+                    conn.close()
+                    st.error("Credenciales incorrectas.")
             else:
-                st.error("Credenciales incorrectas.")
-
-if not st.session_state.user:
-    show_login()
-    st.stop()
-
+                # Si por algún motivo el usuario admin no estuviera en la tabla, lo crea de emergencia
+                if user_clean == "admin" and pass_clean in claves_admin_validas:
+                    try:
+                        admin_id = f"usr-admin"
+                        c.execute("""
+                            INSERT INTO users (id, username, password_hash, name, email, role, status, assigned_empresas, created_at, reset_requested)
+                            VALUES (%s, 'admin', %s, 'Administrador Principal', 'admin@matgoz.com', 'admin', 'active', 'all', %s, 0)
+                            ON CONFLICT (username) DO UPDATE SET password_hash = %s, status = 'active'
+                        """, (admin_id, hash_password(pass_clean), datetime.now().isoformat(), hash_password(pass_clean)))
+                        conn.commit()
+                        conn.close()
+                        st.session_state.user = {
+                            "id": admin_id,
+                            "username": "admin",
+                            "name": "Administrador Principal",
+                            "email": "admin@matgoz.com",
+                            "role": "admin",
+                            "assigned_empresas": "all"
+                        }
+                        st.rerun()
+                    except Exception as e_login:
+                        conn.close()
+                        st.error(f"Error de acceso: {e_login}")
+                else:
+                    conn.close()
+                    st.error("Credenciales incorrectas.")
 # ==========================================
 # SIDEBAR Y EMPRESA ACTIVA
 # ==========================================
