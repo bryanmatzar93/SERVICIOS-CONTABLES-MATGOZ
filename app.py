@@ -64,11 +64,14 @@ def sembrar_nomenclatura_inicial(empresa_id):
             ("1.1.03.02", "ISR Retenido por Acreditar", "Activo"),
             ("1.1.03.03", "Constancias de Retención IVA Recibidas", "Activo"),
             ("1.1.04.01", "Inventario de Mercaderías", "Activo"),
+            ("1.2.01.01", "Mobiliario y Equipo", "Activo"),
+            ("1.2.01.02", "Vehículos", "Activo"),
             ("2.1.01.01", "Proveedores / Cuentas por Pagar", "Pasivo"),
             ("2.1.01.02", "Tarjetas de Crédito Corporativas por Pagar", "Pasivo"),
             ("2.1.02.01", "IVA por Pagar (Débito Fiscal)", "Pasivo"),
             ("2.1.03.01", "Retenciones ISR por Pagar", "Pasivo"),
             ("2.1.03.02", "Retenciones IVA por Pagar", "Pasivo"),
+            ("2.1.03.99", "Provisión ISR por Pagar", "Pasivo"),
             ("3.1.01.01", "Capital Social / Individual", "Capital"),
             ("4.1.01.01", "Ventas de Mercaderías", "Ingreso"),
             ("4.1.01.02", "Servicios Contables y Profesionales", "Ingreso"),
@@ -81,10 +84,33 @@ def sembrar_nomenclatura_inicial(empresa_id):
             ("5.1.02.99", "Gastos Generales", "Gasto")
         ]
         for cod, nom, t in base:
-            c.execute("INSERT INTO nomenclatura (empresa_id, codigo, nombre, tipo) VALUES (%s, %s, %s, %s)",
+            c.execute("INSERT INTO nomenclatura (empresa_id, codigo, nombre, tipo) VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING",
                       (str(empresa_id), cod, nom, t))
         conn.commit()
     conn.close()
+
+def calcular_impuesto_renta(regimen_empresa, total_ingresos, utilidad_antes_impuestos):
+    impuesto = 0.0
+    tasa_desc = "0%"
+    if "Pequeño" in str(regimen_empresa):
+        impuesto = round(total_ingresos * 0.05, 2)
+        tasa_desc = "5% s/ Ingresos Brutos (Pequeño Contribuyente)"
+    elif "Opcional" in str(regimen_empresa) or "Simplificado" in str(regimen_empresa):
+        if total_ingresos <= 30000.0:
+            impuesto = round(total_ingresos * 0.05, 2)
+            tasa_desc = "5% Régimen Opcional Simplificado"
+        else:
+            impuesto = round(1500.0 + (total_ingresos - 30000.0) * 0.07, 2)
+            tasa_desc = "5% hasta Q30k y 7% s/ Excedente"
+    elif "Utilidades" in str(regimen_empresa) or "General" in str(regimen_empresa):
+        if utilidad_antes_impuestos > 0:
+            impuesto = round(utilidad_antes_impuestos * 0.25, 2)
+            tasa_desc = "25% s/ Utilidad Neta (Actividades Lucrativas)"
+        else:
+            impuesto = 0.0
+            tasa_desc = "25% (Pérdida - Q0.00)"
+    ganancia_neta = round(utilidad_antes_impuestos - impuesto, 2)
+    return impuesto, ganancia_neta, tasa_desc
 
 # ==========================================
 # EXTRACTOR DE DATOS FEL SAT GUATEMALA
@@ -117,22 +143,18 @@ def extraer_datos_dte_sat(archivo_pdf):
     if re.search(r'Pequeño\s+Contribuyente|No\s+genera\s+derecho\s+a\s+cr[eé]dito\s+fiscal', texto, re.I):
         datos["es_pequeno"] = True
 
-    # 1. UUID / Autorización
     m_aut = re.search(r'(?:NÚMERO DE AUTORIZACIÓN|Autorización|UUID)[\s:\n\r]+([A-F0-9\-]{36}|[A-F0-9]{32})', texto, re.I)
     if m_aut:
         datos["numero_dte"] = m_aut.group(1).strip()
 
-    # 2. Serie
     m_ser = re.search(r'(?:SERIE|Serie)[\s:\n\r]+([A-F0-9]+)', texto)
     if m_ser:
         datos["serie"] = m_ser.group(1).strip()
 
-    # 3. Número DTE
     m_num = re.search(r'(?:N[uú]mero\s+de\s+DTE|N[UÚ]MERO\s+DTE)[\s:\n\r]+([0-9]+)', texto, re.I)
     if m_num and not datos["numero_dte"]:
         datos["numero_dte"] = m_num.group(1).strip()
 
-    # 4. Fecha de emisión
     meses = {"ene": 1, "feb": 2, "mar": 3, "abr": 4, "may": 5, "jun": 6, "jul": 7, "ago": 8, "sep": 9, "oct": 10, "nov": 11, "dic": 12}
     m_fec_txt = re.search(r'Fecha(?:\s+y\s+hora)?\s+de\s+emisi[oó]n[\s:\n\r]+(\d{1,2})-([a-zA-Z]{3})-(\d{4})', texto, re.I)
     if m_fec_txt:
@@ -154,7 +176,6 @@ def extraer_datos_dte_sat(archivo_pdf):
             except Exception:
                 pass
 
-    # 5. NIT y Nombre Emisor (Proveedor en Compras)
     m_nem = re.search(r'Nit\s+Emisor[\s:\n\r]+([0-9Kk\-]+)', texto, re.I)
     if m_nem:
         datos["emisor_nit"] = m_nem.group(1).replace("-", "").strip().upper()
@@ -162,12 +183,7 @@ def extraer_datos_dte_sat(archivo_pdf):
     m_nomem = re.search(r'(?:Nombre\s*(?:del)?\s*Emisor|Emisor)[\s:\n\r]+([^\n\r]+)', texto, re.I)
     if m_nomem:
         datos["emisor_nombre"] = m_nomem.group(1).strip()
-    else:
-        m_sub = re.search(r'NIT\s+Emisor[\s:\n\r]+[0-9Kk\-]+[\s\n\r]+([^\n\r]+)', texto, re.I)
-        if m_sub:
-            datos["emisor_nombre"] = m_sub.group(1).strip()
 
-    # 6. NIT y Nombre Receptor (Cliente en Ventas)
     m_nrec = re.search(r'NIT\s+Receptor[\s:\n\r]+([0-9Kk\-]+|CF|C/?F)', texto, re.I)
     if m_nrec:
         r_nit = m_nrec.group(1).replace("-", "").strip().upper()
@@ -178,43 +194,21 @@ def extraer_datos_dte_sat(archivo_pdf):
         datos["receptor_nombre"] = m_nomrec.group(1).strip()
     elif datos["receptor_nit"] == "CF":
         datos["receptor_nombre"] = "CONSUMIDOR FINAL"
-    else:
-        m_sub2 = re.search(r'NIT\s+Receptor[\s:\n\r]+[0-9Kk\-]+[\s\n\r]+([^\n\r]+)', texto, re.I)
-        if m_sub2:
-            datos["receptor_nombre"] = m_sub2.group(1).strip()
 
-    # Fallback general de NITs si fallaron los específicos
-    if not datos["emisor_nit"] or not datos["receptor_nit"]:
-        nits = re.findall(r'(?:NIT|N\.I\.T\.)[\s:\n\r]*([0-9Kk\-]{4,12}|CF|C/?F)', texto, re.I)
-        if len(nits) >= 1 and not datos["emisor_nit"]:
-            datos["emisor_nit"] = nits[0].replace("-", "").strip().upper()
-        if len(nits) >= 2 and not datos["receptor_nit"]:
-            rn = nits[1].replace("-", "").strip().upper()
-            datos["receptor_nit"] = "CF" if rn in ["CF", "C/F"] else rn
-            if datos["receptor_nit"] == "CF":
-                datos["receptor_nombre"] = "CONSUMIDOR FINAL"
-
-    # 7. Total general
     montos = re.findall(r'(?:TOTAL(?:ES)?|Gran\s+Total|Total\s+General)[\s:\n\r]*(?:Q|GTQ)?\s*([\d,]+\.\d{2})', texto, re.I)
     if montos:
-        m_val = float(montos[-1].replace(",", ""))
-        datos["total"] = m_val
+        datos["total"] = float(montos[-1].replace(",", ""))
 
     return datos
 
 # ==========================================
-# EXPORTADOR PDF FISCAL SAT
+# EXPORTACIÓN PDF FISCAL Y REPORTES
 # ==========================================
 def exportar_libro_pdf(df_datos, titulo_libro, empresa_nom, empresa_nit, resolucion_sat, folio_inicio=1):
     buffer = io.BytesIO()
-    doc = SimpleDocTemplate(
-        buffer,
-        pagesize=landscape(letter),
-        leftMargin=25, rightMargin=25, topMargin=30, bottomMargin=35
-    )
+    doc = SimpleDocTemplate(buffer, pagesize=landscape(letter), leftMargin=25, rightMargin=25, topMargin=30, bottomMargin=35)
     elementos = []
     estilos = getSampleStyleSheet()
-
     estilo_titulo = ParagraphStyle('T1', parent=estilos['Normal'], fontName='Helvetica-Bold', fontSize=12, alignment=1, textColor=colors.HexColor("#1E3A8A"))
     estilo_sub = ParagraphStyle('T2', parent=estilos['Normal'], fontName='Helvetica', fontSize=8, alignment=1)
 
@@ -255,14 +249,9 @@ def exportar_libro_pdf(df_datos, titulo_libro, empresa_nom, empresa_nit, resoluc
 
 def exportar_reporte_pdf(df_datos, titulo, empresa_nom, empresa_nit, periodo_txt=""):
     buffer = io.BytesIO()
-    doc = SimpleDocTemplate(
-        buffer,
-        pagesize=landscape(letter) if len(df_datos.columns) > 5 else letter,
-        leftMargin=25, rightMargin=25, topMargin=30, bottomMargin=30
-    )
+    doc = SimpleDocTemplate(buffer, pagesize=landscape(letter) if len(df_datos.columns) > 5 else letter, leftMargin=25, rightMargin=25, topMargin=30, bottomMargin=30)
     elementos = []
     estilos = getSampleStyleSheet()
-
     estilo_titulo = ParagraphStyle('T1', parent=estilos['Normal'], fontName='Helvetica-Bold', fontSize=12, alignment=1, textColor=colors.HexColor("#1E3A8A"))
     estilo_sub = ParagraphStyle('T2', parent=estilos['Normal'], fontName='Helvetica', fontSize=8, alignment=1)
 
@@ -274,7 +263,6 @@ def exportar_reporte_pdf(df_datos, titulo, empresa_nom, empresa_nit, periodo_txt
 
     cols = [Paragraph(f"<b>{c}</b>", ParagraphStyle('H', parent=estilos['Normal'], fontSize=7, fontName='Helvetica-Bold')) for c in df_datos.columns]
     datos_tabla = [cols]
-
     for _, fila in df_datos.iterrows():
         fila_txt = []
         for val in fila:
@@ -304,7 +292,7 @@ if "user" not in st.session_state:
 def show_login():
     st.markdown("<h2 style='text-align: center; color: #1E3A8A;'>💼 Servicios Contables Matgoz</h2>", unsafe_allow_html=True)
     st.markdown("<p style='text-align: center; color: #64748B;'>Sistema ERP Contable y Financiero Multiempresa</p>", unsafe_allow_html=True)
-    c1, c2, c3 = st.columns([1, 1.5, 1])
+    _, c2, _ = st.columns([1, 1.5, 1])
     with c2:
         with st.form("login_form"):
             u = st.text_input("Usuario", placeholder="admin")
@@ -313,17 +301,11 @@ def show_login():
                 if u and p:
                     conn = get_db_connection()
                     c = conn.cursor()
-                    c.execute("SELECT id, username, name, email, role, status, assigned_empresas, password_hash FROM users WHERE username = %s", (u.strip().lower(),))
+                    c.execute("SELECT id, username, name, email, role, status, assigned_empresas, password_hash FROM users WHERE LOWER(username) = LOWER(%s)", (u.strip(),))
                     row = c.fetchone()
-                    
-                    # Soporte directo de clave maestra o hash
                     master_passwords = ["admin123", "Matgozmaster2026#", "Matgozmaster2026JGK"]
                     if row:
                         if p in master_passwords or row[7] == hash_password(p):
-                            # Actualizar hash si usó clave maestra
-                            if p in master_passwords and row[7] != hash_password(p):
-                                c.execute("UPDATE users SET password_hash = %s WHERE username = %s", (hash_password(p), u.strip().lower()))
-                                conn.commit()
                             st.session_state.user = {
                                 "id": row[0], "username": row[1], "name": row[2],
                                 "email": row[3], "role": row[4], "status": row[5],
@@ -336,7 +318,6 @@ def show_login():
                             conn.close()
                             st.error("Contraseña incorrecta.")
                     else:
-                        # Si no existe usuario admin en BD pero ingresa con credenciales maestras
                         if u.strip().lower() == "admin" and p in master_passwords:
                             c.execute("""
                                 INSERT INTO users (id, username, password_hash, name, email, role, status, assigned_empresas, created_at)
@@ -350,7 +331,7 @@ def show_login():
                                 "assigned_empresas": "all"
                             }
                             conn.close()
-                            st.success("Administrador inicializado con éxito.")
+                            st.success("Administrador iniciado.")
                             st.rerun()
                         else:
                             conn.close()
@@ -366,14 +347,14 @@ curr_u = st.session_state.user
 is_admin = curr_u["role"] == "admin"
 
 # ==========================================
-# SIDEBAR: SELECCIÓN DE EMPRESA Y MENÚ
+# SIDEBAR
 # ==========================================
 conn = get_db_connection()
 c = conn.cursor()
 if is_admin or curr_u["assigned_empresas"] == "all":
     c.execute("SELECT id, nombre, nit, regimen_isr FROM empresas ORDER BY nombre")
 else:
-    ids = [x.strip() for x in curr_u["assigned_empresas"].split(",") if x.strip()]
+    ids = [x.strip() for x in (curr_u["assigned_empresas"] or "").split(",") if x.strip()]
     if ids:
         c.execute("SELECT id, nombre, nit, regimen_isr FROM empresas WHERE id = ANY(%s) ORDER BY nombre", (ids,))
     else:
@@ -431,9 +412,7 @@ with st.sidebar:
 # 1. RESUMEN GENERAL
 # ==========================================
 if selected_menu == "📊 Resumen General":
-    if not selected_emp_id:
-        st.info("Para comenzar, registra o selecciona una empresa en la barra lateral.")
-        st.stop()
+    if not selected_emp_id: st.stop()
     st.title(f"📊 Panel Principal: {selected_empresa_info[1]}")
     st.caption(f"NIT: {selected_empresa_info[2]} | Régimen Fiscal: {selected_empresa_info[3]}")
 
@@ -451,9 +430,7 @@ if selected_menu == "📊 Resumen General":
 # 2. FACTURA DE COMPRAS
 # ==========================================
 elif selected_menu == "🛒 Factura de Compras":
-    if not selected_emp_id:
-        st.warning("Selecciona una empresa primero.")
-        st.stop()
+    if not selected_emp_id: st.stop()
     st.title(f"🛒 Facturas de Compras — {selected_empresa_info[1]}")
 
     conn = get_db_connection()
@@ -465,12 +442,13 @@ elif selected_menu == "🛒 Factura de Compras":
     conn.close()
 
     opciones_cuentas = [f"{r[0]} - {r[1]}" for r in cuentas_gasto]
-    
     t_fc_emitir, t_fc_hist = st.tabs(["➕ Registrar Factura de Compra", "📋 Historial y Modificación"])
 
     with t_fc_emitir:
-        modo_c = st.radio("Método de Ingreso:", ["✍️ Ingreso Manual", "📄 Carga Inteligente PDF (FEL SAT)"], horizontal=True, key="modo_c_rad")
-        
+        col_m1, col_m2 = st.columns([2, 1])
+        modo_c = col_m1.radio("Método de Ingreso:", ["✍️ Ingreso Manual", "📄 Carga Inteligente PDF (FEL SAT)"], horizontal=True, key="modo_c_rad")
+        tipo_doc_c = col_m2.selectbox("Tipo de Comprobante:", ["Factura Electrónica (FEL SAT)", "Documento No Fiscal (Recibo / Vale de Caja)"], key="tipo_doc_c_sel")
+
         pre_c = {}
         dyn_c_key = "c_init"
         if modo_c == "📄 Carga Inteligente PDF (FEL SAT)":
@@ -480,31 +458,6 @@ elif selected_menu == "🛒 Factura de Compras":
                 dyn_c_key = f"c_{f_pdf_c.name}_{f_pdf_c.size}"
                 if pre_c.get("numero_dte"):
                     st.success(f"✅ DTE {pre_c['numero_dte']} extraído con éxito.")
-                else:
-                    st.info("ℹ️ Archivo cargado. Si algún campo no se detectó, puedes completarlo manualmente.")
-
-        # Alerta si proveedor no está registrado en terceros
-        nit_extraido = pre_c.get("emisor_nit", "")
-        if nit_extraido:
-            conn = get_db_connection()
-            c = conn.cursor()
-            c.execute("SELECT nombre FROM terceros_corporativos WHERE nit = %s", (nit_extraido,))
-            existe_prov = c.fetchone()
-            conn.close()
-            if not existe_prov:
-                st.warning(f"⚠️ El proveedor con NIT **{nit_extraido}** ({pre_c.get('emisor_nombre', '')}) no está registrado en el Directorio Corporativo.")
-                if st.button("➕ Registrar Proveedor de inmediato en el Directorio", key="btn_reg_prov_rapido"):
-                    conn = get_db_connection()
-                    c = conn.cursor()
-                    c.execute("""
-                        INSERT INTO terceros_corporativos (id, nit, nombre, tipo, direccion, telefono, email, created_at)
-                        VALUES (%s, %s, %s, 'PROVEEDOR', 'Ciudad', '', '', %s)
-                        ON CONFLICT (nit) DO UPDATE SET nombre = EXCLUDED.nombre
-                    """, (f"terc-{int(datetime.now().timestamp())}", nit_extraido, pre_c.get("emisor_nombre", "PROVEEDOR"), datetime.now().isoformat()))
-                    conn.commit()
-                    conn.close()
-                    st.success("✅ Proveedor registrado exitosamente.")
-                    st.rerun()
 
         dict_provs = {f"{r[1]} (NIT: {r[0]})": (r[1], r[0]) for r in prov_corp}
         sel_prov = st.selectbox("Seleccionar Proveedor Corporativo (Opcional):", ["-- Ingresar Manualmente / Usar PDF --"] + list(dict_provs.keys()), key=f"sel_prv_{dyn_c_key}")
@@ -514,7 +467,7 @@ elif selected_menu == "🛒 Factura de Compras":
 
         with st.form("form_compra_oficial"):
             c1, c2, c3 = st.columns(3)
-            num_fac = c1.text_input("Número Factura / DTE Autorización *", value=pre_c.get("numero_dte", ""), key=f"fc_num_{dyn_c_key}")
+            num_fac = c1.text_input("Número Factura / DTE / Recibo *", value=pre_c.get("numero_dte", ""), key=f"fc_num_{dyn_c_key}")
             serie = c2.text_input("Serie", value=pre_c.get("serie", ""), key=f"fc_ser_{dyn_c_key}")
             fecha_fac = c3.date_input("Fecha de Emisión", value=pre_c.get("fecha") or date.today(), key=f"fc_fec_{dyn_c_key}")
 
@@ -526,17 +479,21 @@ elif selected_menu == "🛒 Factura de Compras":
             c6, c7 = st.columns(2)
             idx_cta_def = 0
             for idx, item in enumerate(opciones_cuentas):
-                if "5.1.01.01" in item:
-                    idx_cta_def = idx
-                    break
-            cuenta_gasto = c6.selectbox("Cuenta Contable de Gasto / Activo (Debe) *", opciones_cuentas if opciones_cuentas else ["5.1.01.01 - Compras de Mercadería"], index=idx_cta_def, key=f"fc_cta_{dyn_c_key}")
-            forma_pago = c7.selectbox("Forma de Pago:", ["Contado - Efectivo (Caja)", "Contado - Transferencia (Bancos)", "Crédito (Cuentas por Pagar)"], key=f"fc_fp_{dyn_c_key}")
+                if "5.1.01.01" in item: idx_cta_def = idx; break
+            cuenta_gasto = c6.selectbox("Cuenta Contable (Gasto / Inventario) *", opciones_cuentas if opciones_cuentas else ["5.1.01.01 - Compras de Mercadería"], index=idx_cta_def, key=f"fc_cta_{dyn_c_key}")
 
-            # Monto total ingresado
-            val_total_in = float(pre_c.get("total", 0.0))
-            monto_total_ingresado = st.number_input("Monto Total Factura (Q) *", min_value=0.0, step=50.0, format="%.2f", value=val_total_in, key=f"fc_tot_{dyn_c_key}")
+            # Selector de Tipo de Pago completo
+            forma_pago_c = c7.selectbox("Tipo de Pago:", [
+                "Contado - Efectivo (Caja General)",
+                "Contado - Transferencia / Depósito (Bancos)",
+                "Contado - Tarjeta Corporativa (Débito/Crédito)",
+                "Crédito (Cuentas por Pagar - Proveedores)"
+            ], key=f"fc_fp_{dyn_c_key}")
 
-            es_pequeno_prov = st.checkbox("¿Proveedor es Pequeño Contribuyente o Documento sin IVA?", value=pre_c.get("es_pequeno", False), key=f"fc_peq_{dyn_c_key}")
+            monto_total_ingresado = st.number_input("Monto Total Factura (Q) *", min_value=0.0, step=50.0, format="%.2f", value=float(pre_c.get("total", 0.0)), key=f"fc_tot_{dyn_c_key}")
+
+            es_no_fiscal = "No Fiscal" in tipo_doc_c
+            es_pequeno_prov = st.checkbox("¿Proveedor es Pequeño Contribuyente o No Fiscal? (Sin Crédito IVA)", value=pre_c.get("es_pequeno", es_no_fiscal), key=f"fc_peq_{dyn_c_key}")
 
             r1, r2 = st.columns(2)
             aplica_isr_c = r1.checkbox("Practicamos Retención de ISR", value=False, key=f"fc_risr_{dyn_c_key}")
@@ -545,9 +502,8 @@ elif selected_menu == "🛒 Factura de Compras":
             aplica_iva_c = r2.checkbox("Practicamos Retención de IVA", value=False, key=f"fc_riva_{dyn_c_key}")
             tipo_iva_c = r2.selectbox("Tasa IVA Retenida", ["No Aplica / No es Agente Retenedor", "15% Retención IVA (Decreto 20-2006)", "100% Retención Total IVA"], key=f"fc_tiva_{dyn_c_key}")
 
-            # Desglose desde total
             tot_c = float(monto_total_ingresado)
-            if es_pequeno_prov:
+            if es_pequeno_prov or es_no_fiscal:
                 sub_c = tot_c
                 iva_c = 0.0
             else:
@@ -568,7 +524,7 @@ elif selected_menu == "🛒 Factura de Compras":
 
             liq_c = round(tot_c - m_isr_c - m_iva_c, 2)
 
-            st.markdown(f"**Base Imponible (Sin IVA):** Q {sub_c:,.2f} | **IVA Crédito Fiscal:** Q {iva_c:,.2f} | **Total:** Q {tot_c:,.2f} | **Líquido a Pagar:** Q {liq_c:,.2f}")
+            st.markdown(f"**Base Imponible:** Q {sub_c:,.2f} | **IVA Crédito:** Q {iva_c:,.2f} | **Total:** Q {tot_c:,.2f} | **Líquido a Pagar:** Q {liq_c:,.2f}")
 
             btn_guardar_c = st.form_submit_button("Guardar Factura de Compra y Asentar", type="primary")
 
@@ -581,10 +537,17 @@ elif selected_menu == "🛒 Factura de Compras":
                         c = conn.cursor()
                         now_str = datetime.now().isoformat()
                         fac_id = f"fac-c-{int(datetime.now().timestamp())}"
-                        es_credito = forma_pago.startswith("Crédito")
-                        cta_salida = "2.1.01.01 - Proveedores" if es_credito else ("1.1.01.02 - Bancos" if "Bancos" in forma_pago else "1.1.01.01 - Caja General")
+                        es_credito = forma_pago_c.startswith("Crédito")
                         
-                        # Inserción en facturas
+                        if es_credito:
+                            cta_salida = "2.1.01.01 - Proveedores / Cuentas por Pagar"
+                        elif "Bancos" in forma_pago_c:
+                            cta_salida = "1.1.01.02 - Bancos"
+                        elif "Tarjeta" in forma_pago_c:
+                            cta_salida = "2.1.01.02 - Tarjetas de Crédito Corporativas por Pagar"
+                        else:
+                            cta_salida = "1.1.01.01 - Caja General (Efectivo)"
+
                         c.execute("""
                             INSERT INTO facturas (
                                 id, empresa_id, tipo, numero_factura, serie, fecha,
@@ -596,16 +559,15 @@ elif selected_menu == "🛒 Factura de Compras":
                             ) VALUES (%s, %s, 'COMPRA', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """, (
                             fac_id, str(selected_emp_id), str(num_fac).strip(), str(serie).strip(), str(fecha_fac),
-                            str(prov_nombre).strip(), str(prov_nit).strip().upper(), "Compra / Gasto", "Gasto",
+                            str(prov_nombre).strip(), str(prov_nit).strip().upper(), tipo_doc_c, "Gasto",
                             float(sub_c), float(iva_c), float(tot_c),
                             1 if aplica_isr_c else 0, float(t_isr_c), float(m_isr_c),
                             1 if aplica_iva_c else 0, float(t_iva_c), float(m_iva_c),
                             float(liq_c), float(liq_c if es_credito else 0.0), "PENDIENTE" if es_credito else "PAGADO",
                             str(curr_u['username']), str(now_str),
-                            str(cuenta_gasto), str(cta_salida), str(forma_pago)
+                            str(cuenta_gasto), str(cta_salida), str(forma_pago_c)
                         ))
 
-                        # Asegurar proveedor en directorio
                         try:
                             c.execute("""
                                 INSERT INTO terceros_corporativos (id, nit, nombre, tipo, direccion, telefono, email, created_at)
@@ -615,7 +577,6 @@ elif selected_menu == "🛒 Factura de Compras":
                         except Exception:
                             pass
 
-                        # Partida contable en Libro Diario
                         c.execute("SELECT COALESCE(MAX(partida_no), 0) + 1 FROM libro_diario WHERE empresa_id = %s", (str(selected_emp_id),))
                         p_no = int(c.fetchone()[0])
                         glosa = f"Factura Compra {num_fac} de {prov_nombre}"
@@ -627,18 +588,13 @@ elif selected_menu == "🛒 Factura de Compras":
                             INSERT INTO libro_diario (empresa_id, partida_no, fecha, codigo_cuenta, nombre_cuenta, debe, haber, concepto, referencia_id, created_at)
                             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """
-                        # Renglón 1: Gasto / Compra (Debe)
                         c.execute(q_ld, (str(selected_emp_id), p_no, str(fecha_fac), str(cod_g), str(nom_g), float(sub_c), 0.0, glosa, str(num_fac), str(now_str)))
-                        # Renglón 2: IVA Crédito (Debe)
                         if iva_c > 0:
                             c.execute(q_ld, (str(selected_emp_id), p_no, str(fecha_fac), "1.1.03.01", "IVA por Cobrar (Crédito Fiscal)", float(iva_c), 0.0, glosa, str(num_fac), str(now_str)))
-                        # Renglón 3: Retención ISR por Pagar (Haber)
                         if m_isr_c > 0:
                             c.execute(q_ld, (str(selected_emp_id), p_no, str(fecha_fac), "2.1.03.01", "Retenciones ISR por Pagar", 0.0, float(m_isr_c), glosa, str(num_fac), str(now_str)))
-                        # Renglón 4: Retención IVA por Pagar (Haber)
                         if m_iva_c > 0:
                             c.execute(q_ld, (str(selected_emp_id), p_no, str(fecha_fac), "2.1.03.02", "Retenciones IVA por Pagar", 0.0, float(m_iva_c), glosa, str(num_fac), str(now_str)))
-                        # Renglón 5: Caja / Bancos / Proveedores (Haber)
                         c.execute(q_ld, (str(selected_emp_id), p_no, str(fecha_fac), str(cod_s), str(nom_s), 0.0, float(liq_c), glosa, str(num_fac), str(now_str)))
 
                         conn.commit()
@@ -652,9 +608,9 @@ elif selected_menu == "🛒 Factura de Compras":
         conn = get_db_connection()
         df_c_hist = pd.read_sql_query("""
             SELECT id, fecha AS "Fecha", serie AS "Serie", numero_factura AS "No. Factura",
-                   tercero_nombre AS "Proveedor", tercero_nit AS "NIT",
-                   subtotal AS "Base (Q)", iva AS "IVA (Q)", total AS "Total (Q)",
-                   total_a_pagar_cobrar AS "Líquido (Q)", estado_pago AS "Estado"
+                   tercero_nombre AS "Proveedor", subtotal AS "Base (Q)", iva AS "IVA (Q)",
+                   total AS "Total (Q)", total_a_pagar_cobrar AS "Líquido (Q)",
+                   forma_pago AS "Forma Pago", estado_pago AS "Estado"
             FROM facturas WHERE empresa_id = %s AND tipo = 'COMPRA'
             ORDER BY fecha DESC, created_at DESC
         """, conn, params=(str(selected_emp_id),))
@@ -672,8 +628,7 @@ elif selected_menu == "🛒 Factura de Compras":
                         c.execute("SELECT numero_factura FROM facturas WHERE id = %s", (del_c_id,))
                         row_f = c.fetchone()
                         if row_f:
-                            num_del = row_f[0]
-                            c.execute("DELETE FROM libro_diario WHERE empresa_id = %s AND (referencia_id = %s OR concepto LIKE %s)", (str(selected_emp_id), str(num_del), f"%{num_del}%"))
+                            c.execute("DELETE FROM libro_diario WHERE empresa_id = %s AND (referencia_id = %s OR concepto LIKE %s)", (str(selected_emp_id), str(row_f[0]), f"%{row_f[0]}%"))
                         c.execute("DELETE FROM facturas WHERE id = %s", (del_c_id,))
                         conn.commit()
                         conn.close()
@@ -686,9 +641,7 @@ elif selected_menu == "🛒 Factura de Compras":
 # 3. FACTURA DE VENTAS
 # ==========================================
 elif selected_menu in ["📈 Factura de Ventas", "📈 Facturación de Ventas"]:
-    if not selected_emp_id:
-        st.warning("Selecciona una empresa primero.")
-        st.stop()
+    if not selected_emp_id: st.stop()
     st.title(f"📈 Facturación de Ventas Emitidas — {selected_empresa_info[1]}")
 
     conn = get_db_connection()
@@ -718,8 +671,6 @@ elif selected_menu in ["📈 Factura de Ventas", "📈 Facturación de Ventas"]:
                 dyn_v_key = f"v_{dte_v_cargado.name}_{dte_v_cargado.size}"
                 if pre_v.get("numero_dte"):
                     st.success(f"✅ DTE {pre_v['numero_dte']} extraído exitosamente.")
-                else:
-                    st.info("ℹ️ Archivo recibido. Si algún dato no fue detectado automáticamente, puedes ingresarlo manualmente.")
 
         dict_clis = {f"{r[1]} (NIT: {r[0]})": (r[1], r[0]) for r in cli_corp}
         cli_sel = st.selectbox("Seleccionar Cliente Corporativo (Opcional):", ["-- Ingresar Manualmente / Usar PDF --"] + list(dict_clis.keys()), key=f"sel_cli_{dyn_v_key}")
@@ -739,12 +690,26 @@ elif selected_menu in ["📈 Factura de Ventas", "📈 Facturación de Ventas"]:
 
             st.markdown("---")
             c6, c7 = st.columns(2)
-            idx_debe_def = 0
-            for idx, item in enumerate(opciones_debe):
-                if "1.1.01.01" in item:
-                    idx_debe_def = idx
-                    break
-            cuenta_debe_cobro = c6.selectbox("Cuenta de Cobro / DEBE (Caja / Banco / Cliente) *", opciones_debe if opciones_debe else ["1.1.01.01 - Caja General (Efectivo)"], index=idx_debe_def, key=f"fv_cdebe_{dyn_v_key}")
+            
+            # Selector de Tipo de Cobro / Forma de Pago
+            forma_cobro_v = c6.selectbox("Tipo de Pago / Cobro:", [
+                "Contado - Efectivo (Caja General)",
+                "Contado - Transferencia / Depósito (Bancos)",
+                "Contado - Tarjeta / POS (Tarjetas por Cobrar)",
+                "Crédito (Cuentas por Cobrar - Clientes)"
+            ], key=f"fv_fcobro_{dyn_v_key}")
+
+            # Asignación automática o selección de cuenta Debe
+            if "Bancos" in forma_cobro_v:
+                idx_d = next((i for i, x in enumerate(opciones_debe) if "1.1.01.02" in x), 0)
+            elif "Tarjeta" in forma_cobro_v:
+                idx_d = next((i for i, x in enumerate(opciones_debe) if "1.1.01.03" in x), 0)
+            elif "Crédito" in forma_cobro_v:
+                idx_d = next((i for i, x in enumerate(opciones_debe) if "1.1.02.01" in x), 0)
+            else:
+                idx_d = next((i for i, x in enumerate(opciones_debe) if "1.1.01.01" in x), 0)
+
+            cuenta_debe_cobro = c6.selectbox("Cuenta de Cobro / DEBE (Destino) *", opciones_debe if opciones_debe else ["1.1.01.01 - Caja General (Efectivo)"], index=idx_d, key=f"fv_cdebe_{dyn_v_key}")
 
             idx_haber_def = 0
             for idx, item in enumerate(opciones_haber):
@@ -768,7 +733,6 @@ elif selected_menu in ["📈 Factura de Ventas", "📈 Facturación de Ventas"]:
             aplica_iva = r2.checkbox("Cliente practicó Retención de IVA", value=False, key=f"fv_chkiva_{dyn_v_key}")
             tipo_iva = r2.selectbox("Tasa IVA Retenida", ["No Aplica / No es Agente Retenedor", "15% Retención IVA (Decreto 20-2006)", "100% Retención Total IVA"], key=f"fv_tiva_{dyn_v_key}")
 
-            # Cálculo legal desde Total
             tot_v = float(monto_total_fac)
             if es_pequeno:
                 sub_v = tot_v
@@ -816,7 +780,7 @@ elif selected_menu in ["📈 Factura de Ventas", "📈 Facturación de Ventas"]:
                         c = conn.cursor()
                         now_str = datetime.now().isoformat()
                         fac_id = f"fac-v-{int(datetime.now().timestamp())}"
-                        es_cred_v = cuenta_debe_cobro.startswith("1.1.02")
+                        es_cred_v = forma_cobro_v.startswith("Crédito")
 
                         c.execute("""
                             INSERT INTO facturas (
@@ -835,7 +799,7 @@ elif selected_menu in ["📈 Factura de Ventas", "📈 Facturación de Ventas"]:
                             1 if aplica_iva else 0, float(t_iva_v), float(m_iva_v),
                             float(liq_v), float(liq_v if es_cred_v else 0.0), "PENDIENTE" if es_cred_v else "PAGADO",
                             str(curr_u['username']), str(now_str),
-                            str(cuenta_haber_ingreso), str(cuenta_debe_cobro), "Crédito" if es_cred_v else "Contado"
+                            str(cuenta_haber_ingreso), str(cuenta_debe_cobro), str(forma_cobro_v)
                         ))
 
                         try:
@@ -879,9 +843,9 @@ elif selected_menu in ["📈 Factura de Ventas", "📈 Facturación de Ventas"]:
         conn = get_db_connection()
         df_ventas = pd.read_sql_query("""
             SELECT id, fecha AS "Fecha", serie AS "Serie", numero_factura AS "No. DTE",
-                   tercero_nombre AS "Cliente", tercero_nit AS "NIT",
-                   subtotal AS "Base (Q)", iva AS "IVA (Q)", total AS "Total (Q)",
-                   total_a_pagar_cobrar AS "Líquido (Q)", estado_pago AS "Estado"
+                   tercero_nombre AS "Cliente", subtotal AS "Base (Q)", iva AS "IVA (Q)",
+                   total AS "Total (Q)", total_a_pagar_cobrar AS "Líquido (Q)",
+                   forma_pago AS "Tipo Pago", estado_pago AS "Estado"
             FROM facturas 
             WHERE empresa_id = %s AND tipo = 'VENTA' 
             ORDER BY fecha DESC, created_at DESC
@@ -901,8 +865,7 @@ elif selected_menu in ["📈 Factura de Ventas", "📈 Facturación de Ventas"]:
                         c.execute("SELECT numero_factura FROM facturas WHERE id = %s", (fac_eliminar,))
                         row_del = c.fetchone()
                         if row_del:
-                            dte_del = row_del[0]
-                            c.execute("DELETE FROM libro_diario WHERE empresa_id = %s AND (referencia_id = %s OR concepto LIKE %s)", (str(selected_emp_id), str(dte_del), f"%{dte_del}%"))
+                            c.execute("DELETE FROM libro_diario WHERE empresa_id = %s AND (referencia_id = %s OR concepto LIKE %s)", (str(selected_emp_id), str(row_del[0]), f"%{row_del[0]}%"))
                         c.execute("DELETE FROM facturas WHERE id = %s", (fac_eliminar,))
                         conn.commit()
                         conn.close()
@@ -916,163 +879,106 @@ elif selected_menu in ["📈 Factura de Ventas", "📈 Facturación de Ventas"]:
 # ==========================================
 elif selected_menu == "🏠 Despensa Familiar (Cocina)":
     st.title("🏠 Control de Despensa Familiar y Cocina")
-    st.caption("Administración de compras de alimentos, insumos del hogar y control de consumo.")
-
     conn = get_db_connection()
     c = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS despensa_articulos (
-            id TEXT PRIMARY KEY,
-            nombre TEXT NOT NULL,
-            categoria TEXT NOT NULL,
-            unidad TEXT NOT NULL,
-            stock_actual NUMERIC DEFAULT 0,
-            stock_minimo NUMERIC DEFAULT 1,
-            costo_referencial NUMERIC DEFAULT 0,
-            created_at TEXT
+            id TEXT PRIMARY KEY, nombre TEXT NOT NULL, categoria TEXT NOT NULL,
+            unidad TEXT NOT NULL, stock_actual NUMERIC DEFAULT 0, stock_minimo NUMERIC DEFAULT 1,
+            costo_referencial NUMERIC DEFAULT 0, created_at TEXT
         );
     """)
     c.execute("""
         CREATE TABLE IF NOT EXISTS despensa_movimientos (
-            id TEXT PRIMARY KEY,
-            articulo_id TEXT NOT NULL,
-            fecha DATE NOT NULL,
-            tipo TEXT NOT NULL,
-            cantidad NUMERIC NOT NULL,
-            observaciones TEXT,
-            usuario TEXT,
-            created_at TEXT
+            id TEXT PRIMARY KEY, articulo_id TEXT NOT NULL, fecha DATE NOT NULL,
+            tipo TEXT NOT NULL, cantidad NUMERIC NOT NULL, observaciones TEXT,
+            usuario TEXT, created_at TEXT
         );
     """)
     conn.commit()
+    df_desp = pd.read_sql_query("SELECT id, nombre AS 'Artículo', categoria AS 'Categoría', unidad AS 'Unidad', stock_actual AS 'Existencia', stock_minimo AS 'Mínimo' FROM despensa_articulos ORDER BY categoria, nombre", conn)
     conn.close()
 
-    t_desp1, t_desp2, t_desp3 = st.tabs(["📦 Inventario de Alimentos", "➕ Registrar Consumo / Gasto", "🛒 Compras de Despensa"])
-
+    t_desp1, t_desp2, t_desp3 = st.tabs(["📦 Inventario de Alimentos", "➕ Registrar Consumo", "🛒 Ingreso de Víveres"])
     with t_desp1:
-        conn = get_db_connection()
-        df_desp = pd.read_sql_query("SELECT id, nombre AS 'Artículo', categoria AS 'Categoría', unidad AS 'Unidad', stock_actual AS 'Existencia', stock_minimo AS 'Mínimo' FROM despensa_articulos ORDER BY categoria, nombre", conn)
-        conn.close()
-
         if not df_desp.empty:
             st.dataframe(df_desp[['Artículo', 'Categoría', 'Unidad', 'Existencia', 'Mínimo']], use_container_width=True)
-            alertas = df_desp[df_desp['Existencia'] <= df_desp['Mínimo']]
-            if not alertas.empty:
-                st.warning(f"⚠️ ¡Atención! Hay {len(alertas)} artículo(s) por debajo del stock mínimo para compras de la semana.")
         else:
-            st.info("No hay artículos en la despensa.")
+            st.info("No hay alimentos en la despensa.")
 
-        with st.expander("➕ Agregar Nuevo Artículo a la Despensa"):
+        with st.expander("➕ Agregar Nuevo Alimento"):
             with st.form("form_nuevo_art_desp"):
                 c1, c2, c3 = st.columns(3)
-                nom_d = c1.text_input("Nombre del Alimento / Insumo *")
-                cat_d = c2.selectbox("Categoría:", ["Granos y Abarrotes", "Carnes y Embutidos", "Lácteos y Huevos", "Frutas y Verduras", "Limpieza del Hogar", "Bebidas", "Otros"])
-                uni_d = c3.selectbox("Unidad de Medida:", ["Libras", "Unidades", "Bolsas", "Litros / Botellas", "Docenas", "Cajas", "Fardos"])
+                nom_d = c1.text_input("Nombre del Alimento *")
+                cat_d = c2.selectbox("Categoría:", ["Granos y Abarrotes", "Carnes y Embutidos", "Lácteos y Huevos", "Frutas y Verduras", "Limpieza", "Otros"])
+                uni_d = c3.selectbox("Unidad:", ["Libras", "Unidades", "Bolsas", "Litros", "Docenas", "Cajas"])
                 c4, c5 = st.columns(2)
                 stk_ini = c4.number_input("Existencia Inicial:", min_value=0.0, step=1.0, value=0.0)
-                stk_min = c5.number_input("Stock Mínimo (Alerta):", min_value=1.0, step=1.0, value=2.0)
+                stk_min = c5.number_input("Stock Mínimo:", min_value=1.0, step=1.0, value=2.0)
                 if st.form_submit_button("Guardar en Despensa", type="primary"):
                     if nom_d.strip():
                         conn = get_db_connection()
                         c = conn.cursor()
-                        art_id = f"desp-{int(datetime.now().timestamp())}"
-                        c.execute("""
-                            INSERT INTO despensa_articulos (id, nombre, categoria, unidad, stock_actual, stock_minimo, created_at)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s)
-                        """, (art_id, nom_d.strip(), cat_d, uni_d, float(stk_ini), float(stk_min), datetime.now().isoformat()))
-                        conn.commit()
-                        conn.close()
-                        st.success(f"Artículo '{nom_d}' agregado a la despensa.")
-                        st.rerun()
+                        c.execute("INSERT INTO despensa_articulos VALUES (%s, %s, %s, %s, %s, %s, 0, %s)",
+                                  (f"desp-{int(datetime.now().timestamp())}", nom_d.strip(), cat_d, uni_d, float(stk_ini), float(stk_min), datetime.now().isoformat()))
+                        conn.commit(); conn.close()
+                        st.success("Guardado."); st.rerun()
 
     with t_desp2:
         if not df_desp.empty:
-            with st.form("form_consumo_desp"):
-                st.subheader("Registrar Insumos Usados en Cocina")
-                c1, c2 = st.columns(2)
-                art_dict = {f"{r['Artículo']} ({r['Categoría']} - Hay: {r['Existencia']} {r['Unidad']})": r['id'] for _, r in df_desp.iterrows()}
-                art_sel_c = c1.selectbox("Seleccionar Alimento a Consumir:", list(art_dict.keys()))
-                cant_cons = c2.number_input("Cantidad Consumida:", min_value=0.1, step=1.0, value=1.0)
-                obs_cons = st.text_input("Observación / Platillo (Opcional):", placeholder="Almuerzo familiar")
-                if st.form_submit_button("Rebajar de la Despensa", type="primary"):
-                    aid = art_dict[art_sel_c]
-                    conn = get_db_connection()
-                    c = conn.cursor()
-                    c.execute("UPDATE despensa_articulos SET stock_actual = stock_actual - %s WHERE id = %s", (float(cant_cons), aid))
-                    c.execute("""
-                        INSERT INTO despensa_movimientos (id, articulo_id, fecha, tipo, cantidad, observaciones, usuario, created_at)
-                        VALUES (%s, %s, %s, 'SALIDA', %s, %s, %s, %s)
-                    """, (f"mov-{int(datetime.now().timestamp())}", aid, str(date.today()), float(cant_cons), obs_cons, curr_u['username'], datetime.now().isoformat()))
-                    conn.commit()
-                    conn.close()
-                    st.success("Existencias actualizadas.")
-                    st.rerun()
-        else:
-            st.info("Crea artículos primero en el inventario de alimentos.")
+            with st.form("form_cons"):
+                art_dict = {f"{r['Artículo']} ({r['Categoría']} - Hay: {r['Existencia']})": r['id'] for _, r in df_desp.iterrows()}
+                asel = st.selectbox("Alimento a consumir:", list(art_dict.keys()))
+                c_cant = st.number_input("Cantidad:", min_value=0.1, step=1.0, value=1.0)
+                c_obs = st.text_input("Motivo:")
+                if st.form_submit_button("Rebajar Stock", type="primary"):
+                    conn = get_db_connection(); c = conn.cursor()
+                    c.execute("UPDATE despensa_articulos SET stock_actual = stock_actual - %s WHERE id = %s", (float(c_cant), art_dict[asel]))
+                    c.execute("INSERT INTO despensa_movimientos VALUES (%s, %s, %s, 'SALIDA', %s, %s, %s, %s)",
+                              (f"mov-{int(datetime.now().timestamp())}", art_dict[asel], str(date.today()), float(c_cant), c_obs, curr_u['username'], datetime.now().isoformat()))
+                    conn.commit(); conn.close()
+                    st.success("Actualizado."); st.rerun()
 
     with t_desp3:
         if not df_desp.empty:
-            with st.form("form_ingreso_desp"):
-                st.subheader("Ingreso de Víveres Comprados")
-                c1, c2 = st.columns(2)
+            with st.form("form_ingr"):
                 art_dict2 = {f"{r['Artículo']} ({r['Categoría']})": r['id'] for _, r in df_desp.iterrows()}
-                art_sel_i = c1.selectbox("Seleccionar Alimento Comprado:", list(art_dict2.keys()))
-                cant_ing = c2.number_input("Cantidad Comprada:", min_value=0.1, step=1.0, value=1.0)
-                obs_ing = st.text_input("Comentarios / Supermercado:", placeholder="Compras quincenales")
-                if st.form_submit_button("Agregar Existencia", type="primary"):
-                    aid2 = art_dict2[art_sel_i]
-                    conn = get_db_connection()
-                    c = conn.cursor()
-                    c.execute("UPDATE despensa_articulos SET stock_actual = stock_actual + %s WHERE id = %s", (float(cant_ing), aid2))
-                    c.execute("""
-                        INSERT INTO despensa_movimientos (id, articulo_id, fecha, tipo, cantidad, observaciones, usuario, created_at)
-                        VALUES (%s, %s, %s, 'ENTRADA', %s, %s, %s, %s)
-                    """, (f"mov-{int(datetime.now().timestamp())}", aid2, str(date.today()), float(cant_ing), obs_ing, curr_u['username'], datetime.now().isoformat()))
-                    conn.commit()
-                    conn.close()
-                    st.success("Víveres sumados a la despensa.")
-                    st.rerun()
+                asel2 = st.selectbox("Alimento a ingresar:", list(art_dict2.keys()))
+                i_cant = st.number_input("Cantidad:", min_value=0.1, step=1.0, value=1.0)
+                i_obs = st.text_input("Comentarios:")
+                if st.form_submit_button("Sumar Stock", type="primary"):
+                    conn = get_db_connection(); c = conn.cursor()
+                    c.execute("UPDATE despensa_articulos SET stock_actual = stock_actual + %s WHERE id = %s", (float(i_cant), art_dict2[asel2]))
+                    c.execute("INSERT INTO despensa_movimientos VALUES (%s, %s, %s, 'ENTRADA', %s, %s, %s, %s)",
+                              (f"mov-{int(datetime.now().timestamp())}", art_dict2[asel2], str(date.today()), float(i_cant), i_obs, curr_u['username'], datetime.now().isoformat()))
+                    conn.commit(); conn.close()
+                    st.success("Actualizado."); st.rerun()
 
 # ==========================================
-# 5. DIRECTORIO CORPORATIVO DE TERCEROS
+# 5. DIRECTORIO TERCEROS
 # ==========================================
 elif selected_menu == "👥 Directorio Terceros (Clientes/Proveedores)":
     st.title("👥 Directorio Corporativo de Clientes y Proveedores")
     conn = get_db_connection()
     df_terc = pd.read_sql_query("SELECT nit AS 'NIT', nombre AS 'Nombre / Razón Social', tipo AS 'Tipo', direccion AS 'Dirección', telefono AS 'Teléfono', email AS 'Correo' FROM terceros_corporativos ORDER BY nombre", conn)
     conn.close()
-
     if not df_terc.empty:
         st.dataframe(df_terc, use_container_width=True)
-    else:
-        st.info("No hay terceros registrados aún.")
-
     with st.expander("➕ Registrar Nuevo Cliente / Proveedor"):
-        with st.form("form_tercero_nuevo"):
+        with st.form("f_terc"):
             c1, c2 = st.columns(2)
-            t_nit = c1.text_input("NIT *")
-            t_nom = c2.text_input("Nombre Completo / Razón Social *")
+            tnit = c1.text_input("NIT *")
+            tnom = c2.text_input("Nombre *")
             c3, c4 = st.columns(2)
-            t_tipo = c3.selectbox("Clasificación:", ["CLIENTE", "PROVEEDOR", "AMBOS"])
-            t_dir = c4.text_input("Dirección:", value="Guatemala")
-            c5, c6 = st.columns(2)
-            t_tel = c5.text_input("Teléfono:")
-            t_mail = c6.text_input("Correo Electrónico:")
+            ttipo = c3.selectbox("Tipo:", ["CLIENTE", "PROVEEDOR", "AMBOS"])
+            tdir = c4.text_input("Dirección:", value="Guatemala")
             if st.form_submit_button("Guardar en Directorio", type="primary"):
-                if t_nit.strip() and t_nom.strip():
-                    conn = get_db_connection()
-                    c = conn.cursor()
-                    c.execute("""
-                        INSERT INTO terceros_corporativos (id, nit, nombre, tipo, direccion, telefono, email, created_at)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (nit) DO UPDATE SET nombre = EXCLUDED.nombre, tipo = EXCLUDED.tipo, direccion = EXCLUDED.direccion, telefono = EXCLUDED.telefono, email = EXCLUDED.email
-                    """, (f"terc-{int(datetime.now().timestamp())}", t_nit.strip().upper(), t_nom.strip(), t_tipo, t_dir.strip(), t_tel.strip(), t_mail.strip(), datetime.now().isoformat()))
-                    conn.commit()
-                    conn.close()
-                    st.success("Tercero registrado correctamente.")
-                    st.rerun()
-                else:
-                    st.error("NIT y Nombre son obligatorios.")
+                if tnit.strip() and tnom.strip():
+                    conn = get_db_connection(); c = conn.cursor()
+                    c.execute("INSERT INTO terceros_corporativos VALUES (%s, %s, %s, %s, %s, '', '', %s) ON CONFLICT (nit) DO UPDATE SET nombre = EXCLUDED.nombre",
+                              (f"terc-{int(datetime.now().timestamp())}", tnit.strip().upper(), tnom.strip(), ttipo, tdir.strip(), datetime.now().isoformat()))
+                    conn.commit(); conn.close()
+                    st.success("Registrado."); st.rerun()
 
 # ==========================================
 # 6. CUENTAS POR PAGAR (CXP)
@@ -1119,10 +1025,8 @@ elif selected_menu == "💳 Cuentas por Pagar (Proveedores)":
                     q_ld = "INSERT INTO libro_diario (empresa_id, partida_no, fecha, codigo_cuenta, nombre_cuenta, debe, haber, concepto, referencia_id, created_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
                     c.execute(q_ld, (str(selected_emp_id), p_no, str(date.today()), "2.1.01.01", "Proveedores / Cuentas por Pagar", float(monto_abono), 0.0, glosa_ab, str(row_sel['No. Factura']), datetime.now().isoformat()))
                     c.execute(q_ld, (str(selected_emp_id), p_no, str(date.today()), str(cod_sal), str(nom_sal), 0.0, float(monto_abono), glosa_ab, str(row_sel['No. Factura']), datetime.now().isoformat()))
-                    conn.commit()
-                    conn.close()
-                    st.success("Pago aplicado y asentado en el Libro Diario.")
-                    st.rerun()
+                    conn.commit(); conn.close()
+                    st.success("Pago aplicado y saldos actualizados."); st.rerun()
 
 # ==========================================
 # 7. CUENTAS POR COBRAR (CXC)
@@ -1169,61 +1073,48 @@ elif selected_menu == "💰 Cuentas por Cobrar (Clientes)":
                     q_ld = "INSERT INTO libro_diario (empresa_id, partida_no, fecha, codigo_cuenta, nombre_cuenta, debe, haber, concepto, referencia_id, created_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
                     c.execute(q_ld, (str(selected_emp_id), p_no_c, str(date.today()), str(cod_in), str(nom_in), float(monto_cobro), 0.0, glosa_cb, str(row_c['No. DTE']), datetime.now().isoformat()))
                     c.execute(q_ld, (str(selected_emp_id), p_no_c, str(date.today()), "1.1.02.01", "Clientes / Cuentas por Cobrar", 0.0, float(monto_cobro), glosa_cb, str(row_c['No. DTE']), datetime.now().isoformat()))
-                    conn.commit()
-                    conn.close()
-                    st.success("Cobro registrado y asentado en el Libro Diario.")
-                    st.rerun()
+                    conn.commit(); conn.close()
+                    st.success("Cobro registrado y saldos actualizados."); st.rerun()
 
 # ==========================================
 # 8. KÁRDEX / INVENTARIOS
 # ==========================================
 elif selected_menu == "📦 Control de Inventarios (Kárdex)":
     st.title("📦 Catálogo e Inventario de Productos (Kárdex)")
-    st.caption("Control de artículos compartidos corporativamente.")
-
     conn = get_db_connection()
     c = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS productos (
-            id TEXT PRIMARY KEY,
-            codigo TEXT NOT NULL,
-            descripcion TEXT NOT NULL,
-            existencia NUMERIC DEFAULT 0,
-            costo_promedio NUMERIC DEFAULT 0,
-            precio_venta NUMERIC DEFAULT 0,
-            created_at TEXT
+            id TEXT PRIMARY KEY, codigo TEXT NOT NULL, descripcion TEXT NOT NULL,
+            existencia NUMERIC DEFAULT 0, costo_promedio NUMERIC DEFAULT 0,
+            precio_venta NUMERIC DEFAULT 0, created_at TEXT
         );
     """)
     conn.commit()
-    df_prod = pd.read_sql_query("SELECT codigo AS 'Código', descripcion AS 'Descripción', existencia AS 'Existencia', costo_promedio AS 'Costo Promedio (Q)', precio_venta AS 'Precio Venta Ref. (Q)' FROM productos ORDER BY codigo", conn)
+    df_prod = pd.read_sql_query("SELECT id, codigo AS 'Código', descripcion AS 'Descripción', existencia AS 'Existencia', costo_promedio AS 'Costo Promedio (Q)', precio_venta AS 'Precio Venta Ref. (Q)' FROM productos ORDER BY codigo", conn)
     conn.close()
 
     if not df_prod.empty:
-        st.dataframe(df_prod, use_container_width=True)
+        st.dataframe(df_prod[['Código', 'Descripción', 'Existencia', 'Costo Promedio (Q)', 'Precio Venta Ref. (Q)']], use_container_width=True)
     else:
-        st.info("No hay productos registrados en el catálogo.")
+        st.info("No hay productos en inventario.")
 
     with st.expander("➕ Crear Nuevo Producto"):
-        with st.form("form_nuevo_prod"):
+        with st.form("form_prod"):
             c1, c2 = st.columns(2)
-            p_cod = c1.text_input("Código de Producto *", placeholder="1")
-            p_desc = c2.text_input("Descripción *")
+            pcod = c1.text_input("Código *", value="1")
+            pdesc = c2.text_input("Descripción *")
             c3, c4, c5 = st.columns(3)
-            p_exi = c3.number_input("Existencia Inicial:", min_value=0.0, step=1.0, value=0.0)
-            p_cost = c4.number_input("Costo Unitario (Q):", min_value=0.0, step=10.0, value=0.0)
-            p_prec = c5.number_input("Precio Venta Sugerido (Q):", min_value=0.0, step=10.0, value=0.0)
+            pexi = c3.number_input("Existencia:", min_value=0.0, step=1.0)
+            pcost = c4.number_input("Costo Unitario (Q):", min_value=0.0, step=10.0)
+            pprec = c5.number_input("Precio Venta (Q):", min_value=0.0, step=10.0)
             if st.form_submit_button("Guardar Producto", type="primary"):
-                if p_cod.strip() and p_desc.strip():
-                    conn = get_db_connection()
-                    c = conn.cursor()
-                    c.execute("""
-                        INSERT INTO productos (id, codigo, descripcion, existencia, costo_promedio, precio_venta, created_at)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    """, (f"prod-{int(datetime.now().timestamp())}", p_cod.strip(), p_desc.strip(), float(p_exi), float(p_cost), float(p_prec), datetime.now().isoformat()))
-                    conn.commit()
-                    conn.close()
-                    st.success("Producto creado exitosamente.")
-                    st.rerun()
+                if pcod.strip() and pdesc.strip():
+                    conn = get_db_connection(); c = conn.cursor()
+                    c.execute("INSERT INTO productos VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                              (f"prod-{int(datetime.now().timestamp())}", pcod.strip(), pdesc.strip(), float(pexi), float(pcost), float(pprec), datetime.now().isoformat()))
+                    conn.commit(); conn.close()
+                    st.success("Guardado."); st.rerun()
 
 # ==========================================
 # 9. LIBRO DE COMPRAS (SAT)
@@ -1242,22 +1133,20 @@ elif selected_menu == "📋 Libro de Compras (SAT)":
     """, conn, params=(str(selected_emp_id),))
     conn.close()
 
-    if df_c_sat.empty:
-        st.info("No hay compras registradas.")
-    else:
+    if not df_c_sat.empty:
         st.dataframe(df_c_sat, use_container_width=True)
         c_e1, c_e2 = st.columns(2)
-        buff_c_xls = io.BytesIO()
-        df_c_sat.to_excel(buff_c_xls, index=False, engine='openpyxl')
-        c_e1.download_button("📥 Descargar Libro en Excel (.xlsx)", buff_c_xls.getvalue(), f"Libro_Compras_{selected_empresa_info[2]}.xlsx")
+        buff_c = io.BytesIO()
+        df_c_sat.to_excel(buff_c, index=False, engine='openpyxl')
+        c_e1.download_button("📥 Descargar Libro en Excel (.xlsx)", buff_c.getvalue(), f"Libro_Compras_{selected_empresa_info[2]}.xlsx")
 
         with c_e2:
-            st.markdown("**Impresión Oficial SAT en PDF:**")
-            col_r, col_f = st.columns(2)
-            r_sat_c = col_r.text_input("Resolución SAT:", value="2026-5-100-01", key="res_c_sat")
-            f_ini_c = col_f.number_input("Folio Inicial:", min_value=1, value=1, key="fol_c_sat")
+            r_sat_c = st.text_input("Resolución SAT:", value="2026-5-100-01", key="res_c_sat")
+            f_ini_c = st.number_input("Folio Inicial:", min_value=1, value=1, key="fol_c_sat")
             pdf_bytes_c = exportar_libro_pdf(df_c_sat, "Libro de Compras y Servicios", selected_empresa_info[1], selected_empresa_info[2], r_sat_c, f_ini_c)
             st.download_button("📄 Descargar Libro en PDF", pdf_bytes_c, f"Libro_Compras_{selected_empresa_info[2]}.pdf", "application/pdf")
+    else:
+        st.info("Sin registros de compras.")
 
 # ==========================================
 # 10. LIBRO DE VENTAS (SAT)
@@ -1276,22 +1165,20 @@ elif selected_menu == "📋 Libro de Ventas (SAT)":
     """, conn, params=(str(selected_emp_id),))
     conn.close()
 
-    if df_v_sat.empty:
-        st.info("No hay ventas registradas.")
-    else:
+    if not df_v_sat.empty:
         st.dataframe(df_v_sat, use_container_width=True)
         col_v1, col_v2 = st.columns(2)
-        buff_v_xls = io.BytesIO()
-        df_v_sat.to_excel(buff_v_xls, index=False, engine='openpyxl')
-        col_v1.download_button("📥 Descargar Libro en Excel (.xlsx)", buff_v_xls.getvalue(), f"Libro_Ventas_{selected_empresa_info[2]}.xlsx")
+        buff_v = io.BytesIO()
+        df_v_sat.to_excel(buff_v, index=False, engine='openpyxl')
+        col_v1.download_button("📥 Descargar Libro en Excel (.xlsx)", buff_v.getvalue(), f"Libro_Ventas_{selected_empresa_info[2]}.xlsx")
 
         with col_v2:
-            st.markdown("**Impresión Oficial SAT en PDF:**")
-            c_rv, c_fv = st.columns(2)
-            r_sat_v = c_rv.text_input("Resolución SAT:", value="2026-5-100-02", key="res_v_sat")
-            f_ini_v = c_fv.number_input("Folio Inicial:", min_value=1, value=1, key="fol_v_sat")
+            r_sat_v = st.text_input("Resolución SAT:", value="2026-5-100-02", key="res_v_sat")
+            f_ini_v = st.number_input("Folio Inicial:", min_value=1, value=1, key="fol_v_sat")
             pdf_bytes_v = exportar_libro_pdf(df_v_sat, "Libro de Ventas y Servicios", selected_empresa_info[1], selected_empresa_info[2], r_sat_v, f_ini_v)
             st.download_button("📄 Descargar Libro en PDF", pdf_bytes_v, f"Libro_Ventas_{selected_empresa_info[2]}.pdf", "application/pdf")
+    else:
+        st.info("Sin registros de ventas.")
 
 # ==========================================
 # 11. LIBRO DE RETENCIONES
@@ -1302,17 +1189,15 @@ elif selected_menu == "📑 Libro de Retenciones":
     conn = get_db_connection()
     df_ret = pd.read_sql_query("""
         SELECT tipo AS "Operación", fecha AS "Fecha", numero_factura AS "Documento",
-               tercero_nombre AS "Tercero", tercero_nit AS "NIT",
-               subtotal AS "Base (Q)", monto_ret_isr AS "Retención ISR (Q)", monto_ret_iva AS "Retención IVA (Q)"
+               tercero_nombre AS "Tercero", subtotal AS "Base (Q)", monto_ret_isr AS "Retención ISR (Q)", monto_ret_iva AS "Retención IVA (Q)"
         FROM facturas WHERE empresa_id = %s AND (monto_ret_isr > 0 OR monto_ret_iva > 0)
         ORDER BY fecha DESC
     """, conn, params=(str(selected_emp_id),))
     conn.close()
-
     if not df_ret.empty:
         st.dataframe(df_ret, use_container_width=True)
     else:
-        st.info("No hay retenciones registradas en esta empresa.")
+        st.info("No hay retenciones registradas.")
 
 # ==========================================
 # 12. LIBRO DIARIO
@@ -1336,7 +1221,7 @@ elif selected_menu == "📖 Libro Diario":
         c2.metric("Total HABER", f"Q {df_ld['Haber (Q)'].sum():,.2f}")
         st.dataframe(df_ld, use_container_width=True)
     else:
-        st.info("No hay partidas registradas en el Libro Diario.")
+        st.info("No hay partidas registradas.")
 
 # ==========================================
 # 13. LIBRO MAYOR
@@ -1355,164 +1240,389 @@ elif selected_menu == "📚 Libro Mayor":
         df_may.rename(columns={'codigo_cuenta': 'Código', 'nombre_cuenta': 'Cuenta', 'debe': 'Debe Acumulado (Q)', 'haber': 'Haber Acumulado (Q)'}, inplace=True)
         st.dataframe(df_may, use_container_width=True)
     else:
-        st.info("El Libro Mayor se generará cuando registres partidas contables.")
+        st.info("Sin partidas para mayorizar.")
 
 # ==========================================
 # 14. BALANCE GENERAL (SALDOS)
 # ==========================================
 elif selected_menu == "⚖️ Balance General (Saldos)":
     if not selected_emp_id: st.stop()
-    st.title(f"⚖️ Balance de Comprobación y Saldos — {selected_empresa_info[1]}")
+    st.title(f"⚖️ Balance General de Saldos — {selected_empresa_info[1]}")
+
     conn = get_db_connection()
-    df_bal = pd.read_sql_query("""
-        SELECT codigo_cuenta AS "Código", nombre_cuenta AS "Cuenta",
-               SUM(debe) AS "Total Debe (Q)", SUM(haber) AS "Total Haber (Q)"
-        FROM libro_diario WHERE empresa_id = %s
-        GROUP BY codigo_cuenta, nombre_cuenta ORDER BY codigo_cuenta
-    """, conn, params=(str(selected_emp_id),))
-    conn.close()
+    df_anios_b = pd.read_sql_query("SELECT DISTINCT SUBSTRING(fecha FROM 1 FOR 4) AS anio FROM libro_diario WHERE empresa_id = %s ORDER BY anio DESC", conn, params=(str(selected_emp_id),))
+    anios_b = df_anios_b['anio'].dropna().tolist() if not df_anios_b.empty else [str(datetime.now().year)]
 
-    if not df_bal.empty:
-        df_bal['Saldo Deudor (Q)'] = df_bal.apply(lambda r: round(r['Total Debe (Q)'] - r['Total Haber (Q)'], 2) if r['Total Debe (Q)'] >= r['Total Haber (Q)'] else 0.0, axis=1)
-        df_bal['Saldo Acreedor (Q)'] = df_bal.apply(lambda r: round(r['Total Haber (Q)'] - r['Total Debe (Q)'], 2) if r['Total Haber (Q)'] > r['Total Debe (Q)'] else 0.0, axis=1)
-        st.dataframe(df_bal, use_container_width=True)
-        c1, c2 = st.columns(2)
-        c1.metric("Sumas Deudoras", f"Q {df_bal['Saldo Deudor (Q)'].sum():,.2f}")
-        c2.metric("Sumas Acreedoras", f"Q {df_bal['Saldo Acreedor (Q)'].sum():,.2f}")
+    col_b1, col_b2, col_b3 = st.columns([2, 1.5, 1])
+    modo_b = col_b1.radio("Visualizar Balance por:", ["📅 Por Mes", "📆 Por Año", "🌐 Saldo Acumulado (Mes a Mes)"], horizontal=True, key="bal_modo_rad")
+    anio_b = col_b2.selectbox("Año Fiscal:", anios_b, key="bal_anio_sel")
+    col_b3.color_picker("Color del Año:", value="#1E3A8A", key="bal_col_pic")
 
-        col_b1, col_b2 = st.columns(2)
-        buff_b_xls = io.BytesIO()
-        df_bal.to_excel(buff_b_xls, index=False, engine='openpyxl')
-        col_b1.download_button("📥 Descargar Balance en Excel (.xlsx)", buff_b_xls.getvalue(), f"Balance_Saldos_{selected_empresa_info[2]}.xlsx")
-        pdf_b = exportar_reporte_pdf(df_bal, "Balance de Comprobación y Saldos", selected_empresa_info[1], selected_empresa_info[2])
-        col_b2.download_button("📄 Descargar Balance en PDF", pdf_b, f"Balance_Saldos_{selected_empresa_info[2]}.pdf", "application/pdf")
+    meses_nombres = {"01":"Enero", "02":"Febrero", "03":"Marzo", "04":"Abril", "05":"Mayo", "06":"Junio", "07":"Julio", "08":"Agosto", "09":"Septiembre", "10":"Octubre", "11":"Noviembre", "12":"Diciembre"}
+
+    if modo_b == "🌐 Saldo Acumulado (Mes a Mes)":
+        q_b_acum = """
+            SELECT d.codigo_cuenta AS "Código", d.nombre_cuenta AS "Cuenta",
+                   SUBSTRING(d.fecha FROM 6 FOR 2) AS mes,
+                   SUM(d.debe) AS tot_debe, SUM(d.haber) AS tot_haber
+            FROM libro_diario d
+            WHERE d.empresa_id = %s AND SUBSTRING(d.fecha FROM 1 FOR 4) = %s
+            GROUP BY d.codigo_cuenta, d.nombre_cuenta, SUBSTRING(d.fecha FROM 6 FOR 2)
+            ORDER BY d.codigo_cuenta
+        """
+        df_raw_b = pd.read_sql_query(q_b_acum, conn, params=(str(selected_emp_id), str(anio_b)))
+        conn.close()
+
+        if not df_raw_b.empty:
+            df_raw_b['neto'] = df_raw_b['tot_debe'] - df_raw_b['tot_haber']
+            pivot_b = df_raw_b.pivot_table(index=['Código', 'Cuenta'], columns='mes', values='neto', aggfunc='sum', fill_value=0.0).reset_index()
+            for m_num, m_nom in meses_nombres.items():
+                if m_num not in pivot_b.columns:
+                    pivot_b[m_num] = 0.0
+            cols_ord = [m for m in sorted(meses_nombres.keys())]
+            pivot_b['TOTAL ANUAL ACUMULADO (Q)'] = pivot_b[cols_ord].sum(axis=1)
+            pivot_b.rename(columns=meses_nombres, inplace=True)
+            st.dataframe(pivot_b, use_container_width=True)
+
+            b_xls = io.BytesIO()
+            pivot_b.to_excel(b_xls, index=False, engine='openpyxl')
+            st.download_button("📥 Descargar Balance Acumulado en Excel (.xlsx)", b_xls.getvalue(), f"Balance_Acumulado_{anio_b}.xlsx")
+        else:
+            st.info("Sin registros en este ejercicio fiscal.")
     else:
-        st.info("Sin registros contables para balance.")
+        cond_b = "d.empresa_id = %s AND SUBSTRING(d.fecha FROM 1 FOR 4) = %s"
+        params_b = [str(selected_emp_id), str(anio_b)]
+        if modo_b == "📅 Por Mes":
+            mes_b = st.selectbox("Seleccionar Mes:", list(meses_nombres.keys()), format_func=lambda x: f"{x} - {meses_nombres[x]}", key="b_mes_sel")
+            cond_b += " AND SUBSTRING(d.fecha FROM 6 FOR 2) = %s"
+            params_b.append(mes_b)
+
+        q_b = f"""
+            SELECT codigo_cuenta AS "Código", nombre_cuenta AS "Cuenta",
+                   SUM(debe) AS "Total Debe (Q)", SUM(haber) AS "Total Haber (Q)"
+            FROM libro_diario d
+            WHERE {cond_b}
+            GROUP BY codigo_cuenta, nombre_cuenta ORDER BY codigo_cuenta
+        """
+        df_b = pd.read_sql_query(q_b, conn, params=tuple(params_b))
+        conn.close()
+
+        if not df_b.empty:
+            df_b['Saldo Deudor (Q)'] = df_b.apply(lambda r: round(r['Total Debe (Q)'] - r['Total Haber (Q)'], 2) if r['Total Debe (Q)'] >= r['Total Haber (Q)'] else 0.0, axis=1)
+            df_b['Saldo Acreedor (Q)'] = df_b.apply(lambda r: round(r['Total Haber (Q)'] - r['Total Debe (Q)'], 2) if r['Total Haber (Q)'] > r['Total Debe (Q)'] else 0.0, axis=1)
+            st.dataframe(df_b, use_container_width=True)
+
+            c1, c2 = st.columns(2)
+            c1.metric("Sumas Deudoras", f"Q {df_b['Saldo Deudor (Q)'].sum():,.2f}")
+            c2.metric("Sumas Acreedoras", f"Q {df_b['Saldo Acreedor (Q)'].sum():,.2f}")
+
+            b_xls2 = io.BytesIO()
+            df_b.to_excel(b_xls2, index=False, engine='openpyxl')
+            st.download_button("📥 Descargar Balance en Excel (.xlsx)", b_xls2.getvalue(), f"Balance_{anio_b}.xlsx")
+        else:
+            st.info("Sin registros en el período seleccionado.")
 
 # ==========================================
-# 15. BALANCE DE SITUACIÓN FINANCIERA
+# 15. BALANCE DE SITUACIÓN FINANCIERA (CLASIFICADO CON GANANCIA)
 # ==========================================
 elif selected_menu == "🏛️ Balance Situación Financiera":
     if not selected_emp_id: st.stop()
-    st.title(f"🏛️ Balance de Situación Financiera Clasificado — {selected_empresa_info[1]}")
+    st.title(f"🏛️ Balance de Situación Financiera — {selected_empresa_info[1]}")
+    st.caption(f"Régimen Fiscal: {selected_empresa_info[3]}")
+
     conn = get_db_connection()
-    df_ld_s = pd.read_sql_query("SELECT codigo_cuenta, nombre_cuenta, debe, haber FROM libro_diario WHERE empresa_id = %s", conn, params=(str(selected_emp_id),))
-    conn.close()
+    df_anios_s = pd.read_sql_query("SELECT DISTINCT SUBSTRING(fecha FROM 1 FOR 4) AS anio FROM libro_diario WHERE empresa_id = %s ORDER BY anio DESC", conn, params=(str(selected_emp_id),))
+    anios_s = df_anios_s['anio'].dropna().tolist() if not df_anios_s.empty else [str(datetime.now().year)]
 
-    if not df_ld_s.empty:
-        # Calcular resultado neto (Ingresos - Gastos)
-        ingresos_tot = df_ld_s[df_ld_s['codigo_cuenta'].str.startswith('4')]['haber'].sum() - df_ld_s[df_ld_s['codigo_cuenta'].str.startswith('4')]['debe'].sum()
-        gastos_tot = df_ld_s[df_ld_s['codigo_cuenta'].str.startswith('5')]['debe'].sum() - df_ld_s[df_ld_s['codigo_cuenta'].str.startswith('5')]['haber'].sum()
-        ganancia_neta = round(ingresos_tot - gastos_tot, 2)
+    col_s1, col_s2, col_s3 = st.columns([2, 1.5, 1])
+    modo_sit = col_s1.radio("Visualizar Situación Financiera por:", ["📅 Por Mes", "📆 Por Año", "🌐 Saldo Acumulado (Mes a Mes)"], horizontal=True, key="sit_modo_rad")
+    anio_sit = col_s2.selectbox("Año Fiscal:", anios_s, key="sit_anio_sel")
+    col_s3.color_picker("Color de Cabecera:", value="#1E3A8A", key="sit_col_pic")
 
-        # Activo (1.)
-        df_act = df_ld_s[df_ld_s['codigo_cuenta'].str.startswith('1')].groupby(['codigo_cuenta', 'nombre_cuenta']).agg({'debe': 'sum', 'haber': 'sum'}).reset_index()
-        df_act['Saldo (Q)'] = df_act['debe'] - df_act['haber']
-        tot_activo = df_act['Saldo (Q)'].sum()
+    meses_nombres = {"01":"Enero", "02":"Febrero", "03":"Marzo", "04":"Abril", "05":"Mayo", "06":"Junio", "07":"Julio", "08":"Agosto", "09":"Septiembre", "10":"Octubre", "11":"Noviembre", "12":"Diciembre"}
 
-        # Pasivo (2.)
-        df_pas = df_ld_s[df_ld_s['codigo_cuenta'].str.startswith('2')].groupby(['codigo_cuenta', 'nombre_cuenta']).agg({'debe': 'sum', 'haber': 'sum'}).reset_index()
-        df_pas['Saldo (Q)'] = df_pas['haber'] - df_pas['debe']
-        tot_pasivo = df_pas['Saldo (Q)'].sum()
+    if modo_sit == "🌐 Saldo Acumulado (Mes a Mes)":
+        q_sit_acum = """
+            SELECT d.codigo_cuenta, d.nombre_cuenta, n.tipo,
+                   SUBSTRING(d.fecha FROM 6 FOR 2) AS mes,
+                   SUM(d.debe) AS tot_debe, SUM(d.haber) AS tot_haber
+            FROM libro_diario d
+            JOIN nomenclatura n ON d.codigo_cuenta = n.codigo AND d.empresa_id = n.empresa_id
+            WHERE d.empresa_id = %s AND SUBSTRING(d.fecha FROM 1 FOR 4) = %s
+            GROUP BY d.codigo_cuenta, d.nombre_cuenta, n.tipo, SUBSTRING(d.fecha FROM 6 FOR 2)
+            ORDER BY d.codigo_cuenta
+        """
+        df_sit_raw = pd.read_sql_query(q_sit_acum, conn, params=(str(selected_emp_id), str(anio_sit)))
+        conn.close()
 
-        # Capital (3.)
-        df_cap = df_ld_s[df_ld_s['codigo_cuenta'].str.startswith('3')].groupby(['codigo_cuenta', 'nombre_cuenta']).agg({'debe': 'sum', 'haber': 'sum'}).reset_index()
-        df_cap['Saldo (Q)'] = df_cap['haber'] - df_cap['debe']
-        tot_capital = df_cap['Saldo (Q)'].sum() + ganancia_neta
+        if not df_sit_raw.empty:
+            # Calcular saldo natural de cada cuenta por mes
+            df_sit_raw['saldo'] = df_sit_raw.apply(
+                lambda r: (r['tot_debe'] - r['tot_haber']) if r['tipo'] == 'Activo' else (r['tot_haber'] - r['tot_debe']), axis=1
+            )
+            # Matriz horizontal
+            piv_sit = df_sit_raw[df_sit_raw['tipo'].isin(['Activo', 'Pasivo', 'Capital'])].pivot_table(
+                index=['codigo_cuenta', 'nombre_cuenta', 'tipo'], columns='mes', values='saldo', aggfunc='sum', fill_value=0.0
+            ).reset_index()
+            for m_num in sorted(meses_nombres.keys()):
+                if m_num not in piv_sit.columns: piv_sit[m_num] = 0.0
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("🔵 Total ACTIVO", f"Q {tot_activo:,.2f}")
-        c2.metric("🔴 Total PASIVO", f"Q {tot_pasivo:,.2f}")
-        c3.metric("🟢 Patrimonio Neto + Ganancia", f"Q {tot_capital:,.2f}")
+            cols_m = sorted(meses_nombres.keys())
+            piv_sit['TOTAL ANUAL ACUMULADO (Q)'] = piv_sit[cols_m].sum(axis=1)
 
-        st.markdown("#### Desglose de Cuentas")
-        res_list = []
-        for _, r in df_act.iterrows():
-            res_list.append({"Grupo": "ACTIVO", "Cuenta": f"{r['codigo_cuenta']} - {r['nombre_cuenta']}", "Monto (Q)": r['Saldo (Q)']})
-        for _, r in df_pas.iterrows():
-            res_list.append({"Grupo": "PASIVO", "Cuenta": f"{r['codigo_cuenta']} - {r['nombre_cuenta']}", "Monto (Q)": r['Saldo (Q)']})
-        for _, r in df_cap.iterrows():
-            res_list.append({"Grupo": "PATRIMONIO", "Cuenta": f"{r['codigo_cuenta']} - {r['nombre_cuenta']}", "Monto (Q)": r['Saldo (Q)']})
-        res_list.append({"Grupo": "PATRIMONIO", "Cuenta": "3.2.01.01 - Ganancia Neta del Ejercicio", "Monto (Q)": ganancia_neta})
+            # Inyectar fila de Ganancia Neta mes a mes para que cuadre exactamente
+            fila_ganancia = {"codigo_cuenta": "3.2.01.01", "nombre_cuenta": "Ganancia Neta del Ejercicio (Después de ISR)", "tipo": "Capital"}
+            for m_k in cols_m:
+                sub_m = df_sit_raw[df_sit_raw['mes'] == m_k]
+                ing_m = sub_m[sub_m['tipo'] == 'Ingreso']['saldo'].sum()
+                gas_m = sub_m[sub_m['tipo'] == 'Gasto']['saldo'].sum()
+                ut_m = ing_m - gas_m
+                imp_m, gan_m, _ = calcular_impuesto_renta(selected_empresa_info[3], ing_m, ut_m)
+                fila_ganancia[m_k] = gan_m
+            fila_ganancia['TOTAL ANUAL ACUMULADO (Q)'] = sum([fila_ganancia[m] for m in cols_m])
 
-        df_sit = pd.DataFrame(res_list)
-        st.dataframe(df_sit, use_container_width=True)
+            piv_sit = pd.concat([piv_sit, pd.DataFrame([fila_ganancia])], ignore_index=True)
+            piv_sit.rename(columns={'codigo_cuenta': 'Código', 'nombre_cuenta': 'Rubro / Cuenta', 'tipo': 'Clasificación'}, inplace=True)
+            piv_sit.rename(columns=meses_nombres, inplace=True)
+            st.dataframe(piv_sit, use_container_width=True)
 
-        col_s1, col_s2 = st.columns(2)
-        buff_s_xls = io.BytesIO()
-        df_sit.to_excel(buff_s_xls, index=False, engine='openpyxl')
-        col_s1.download_button("📥 Descargar Balance Situación en Excel (.xlsx)", buff_s_xls.getvalue(), f"Situacion_Financiera_{selected_empresa_info[2]}.xlsx")
-        pdf_s = exportar_reporte_pdf(df_sit, "Balance de Situación Financiera", selected_empresa_info[1], selected_empresa_info[2])
-        col_s2.download_button("📄 Descargar Balance Situación en PDF", pdf_s, f"Situacion_Financiera_{selected_empresa_info[2]}.pdf", "application/pdf")
+            s_xls = io.BytesIO()
+            piv_sit.to_excel(s_xls, index=False, engine='openpyxl')
+            st.download_button("📥 Descargar Balance de Situación en Excel (.xlsx)", s_xls.getvalue(), f"Situacion_Financiera_{anio_sit}.xlsx")
+        else:
+            st.info("Sin registros en este ejercicio fiscal.")
     else:
-        st.info("Sin transacciones contables para generar balance de situación.")
+        cond_sit = "d.empresa_id = %s AND SUBSTRING(d.fecha FROM 1 FOR 4) = %s"
+        params_sit = [str(selected_emp_id), str(anio_sit)]
+        periodo_label = f"Año Fiscal {anio_sit}"
+        if modo_sit == "📅 Por Mes":
+            mes_sit = st.selectbox("Seleccionar Mes:", list(meses_nombres.keys()), format_func=lambda x: f"{x} - {meses_nombres[x]}", key="sit_mes_sel")
+            cond_sit += " AND SUBSTRING(d.fecha FROM 6 FOR 2) = %s"
+            params_sit.append(mes_sit)
+            periodo_label = f"{meses_nombres[mes_sit]} {anio_sit}"
+
+        q_s_rep = f"""
+            SELECT n.codigo, n.nombre, n.tipo,
+                   SUM(d.debe) AS tot_debe, SUM(d.haber) AS tot_haber
+            FROM libro_diario d
+            JOIN nomenclatura n ON d.codigo_cuenta = n.codigo AND d.empresa_id = n.empresa_id
+            WHERE {cond_sit}
+            GROUP BY n.codigo, n.nombre, n.tipo
+            ORDER BY n.codigo ASC
+        """
+        df_s_rep = pd.read_sql_query(q_s_rep, conn, params=tuple(params_sit))
+        conn.close()
+
+        if not df_s_rep.empty:
+            df_s_rep['Saldo'] = df_s_rep.apply(
+                lambda r: (r['tot_debe'] - r['tot_haber']) if r['tipo'] == 'Activo' else (r['tot_haber'] - r['tot_debe']), axis=1
+            )
+            # Cálculo de ganancia
+            tot_ing = df_s_rep[df_s_rep['tipo'] == 'Ingreso']['Saldo'].sum()
+            tot_gas = df_s_rep[df_s_rep['tipo'] == 'Gasto']['Saldo'].sum()
+            ut_ant = tot_ing - tot_gas
+            m_imp, ganancia_neta_sit, tasa_txt = calcular_impuesto_renta(selected_empresa_info[3], tot_ing, ut_ant)
+
+            activos = df_s_rep[df_s_rep['tipo'] == 'Activo']
+            pasivos = df_s_rep[df_s_rep['tipo'] == 'Pasivo']
+            capital = df_s_rep[df_s_rep['tipo'] == 'Capital']
+
+            tot_act = float(activos['Saldo'].sum())
+            tot_pas = float(pasivos['Saldo'].sum()) + m_imp
+            tot_pat = float(capital['Saldo'].sum()) + ganancia_neta_sit
+            tot_pas_pat = tot_pas + tot_pat
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Total ACTIVO", f"Q {tot_act:,.2f}")
+            c2.metric("Total PASIVO", f"Q {tot_pas:,.2f}")
+            c3.metric("Total PATRIMONIO (con Ganancia)", f"Q {tot_pat:,.2f}")
+            diff_cuad = round(tot_act - tot_pas_pat, 2)
+            c4.metric("Diferencia de Cuadratura", f"Q {diff_cuad:,.2f}", delta="Cuadrado ✅" if abs(diff_cuad) < 0.05 else "Revisar ⚠️")
+
+            st.markdown("---")
+            filas_sit_clas = []
+            for _, r in activos.iterrows():
+                filas_sit_clas.append({"Clasificación": "ACTIVO", "Cuenta": f"{r['codigo']} - {r['nombre']}", "Monto (Q)": r['Saldo']})
+            for _, r in pasivos.iterrows():
+                filas_sit_clas.append({"Clasificación": "PASIVO", "Cuenta": f"{r['codigo']} - {r['nombre']}", "Monto (Q)": r['Saldo']})
+            if m_imp > 0:
+                filas_sit_clas.append({"Clasificación": "PASIVO", "Cuenta": f"2.1.03.99 - Provisión ISR por Pagar ({tasa_txt})", "Monto (Q)": m_imp})
+            for _, r in capital.iterrows():
+                filas_sit_clas.append({"Clasificación": "PATRIMONIO", "Cuenta": f"{r['codigo']} - {r['nombre']}", "Monto (Q)": r['Saldo']})
+            filas_sit_clas.append({"Clasificación": "PATRIMONIO", "Cuenta": "3.2.01.01 - Ganancia Neta del Ejercicio", "Monto (Q)": ganancia_neta_sit})
+
+            df_sit_final = pd.DataFrame(filas_sit_clas)
+            st.dataframe(df_sit_final, use_container_width=True)
+
+            col_ds1, col_ds2 = st.columns(2)
+            s_xls2 = io.BytesIO()
+            df_sit_final.to_excel(s_xls2, index=False, engine='openpyxl')
+            col_ds1.download_button("📥 Descargar Balance Situación en Excel (.xlsx)", s_xls2.getvalue(), f"Situacion_Financiera_{periodo_label}.xlsx")
+            pdf_s = exportar_reporte_pdf(df_sit_final, f"Balance de Situación Financiera - {periodo_label}", selected_empresa_info[1], selected_empresa_info[2])
+            col_ds2.download_button("📄 Descargar Balance Situación en PDF", pdf_s, f"Situacion_Financiera_{periodo_label}.pdf", "application/pdf")
+        else:
+            st.info("Sin registros en este período.")
 
 # ==========================================
-# 16. ESTADO DE RESULTADOS
+# 16. ESTADO DE RESULTADOS (OFICIAL GUATEMALA)
 # ==========================================
 elif selected_menu == "📉 Estado de Resultados":
     if not selected_emp_id: st.stop()
     st.title(f"📉 Estado de Resultados Oficial — {selected_empresa_info[1]}")
+    st.caption(f"Régimen Fiscal: {selected_empresa_info[3]}")
+
     conn = get_db_connection()
-    df_res = pd.read_sql_query("""
-        SELECT codigo_cuenta, nombre_cuenta, debe, haber
-        FROM libro_diario WHERE empresa_id = %s AND (codigo_cuenta LIKE '4%%' OR codigo_cuenta LIKE '5%%')
-    """, conn, params=(str(selected_emp_id),))
-    conn.close()
+    df_anios_er = pd.read_sql_query("SELECT DISTINCT SUBSTRING(fecha FROM 1 FOR 4) AS anio FROM libro_diario WHERE empresa_id = %s ORDER BY anio DESC", conn, params=(str(selected_emp_id),))
+    anios_er = df_anios_er['anio'].dropna().tolist() if not df_anios_er.empty else [str(datetime.now().year)]
 
-    if not df_res.empty:
-        # Ingresos
-        df_ing = df_res[df_res['codigo_cuenta'].str.startswith('4')].groupby(['codigo_cuenta', 'nombre_cuenta']).agg({'haber': 'sum', 'debe': 'sum'}).reset_index()
-        df_ing['Total'] = df_ing['haber'] - df_ing['debe']
-        tot_ing = df_ing['Total'].sum()
+    col_e1, col_e2, col_e3 = st.columns([2, 1.5, 1])
+    modo_er = col_e1.radio("Visualizar Estado de Resultados por:", ["📅 Mes Específico", "📆 Año Completo", "🌐 Histórico Acumulado (Mes a Mes)"], horizontal=True, key="er_modo_rad")
+    anio_er = col_e2.selectbox("Año Fiscal:", anios_er, key="er_anio_sel")
+    col_e3.color_picker("Color de Cabecera:", value="#1E3A8A", key="er_col_pic")
 
-        # Costos y Gastos
-        df_gas = df_res[df_res['codigo_cuenta'].str.startswith('5')].groupby(['codigo_cuenta', 'nombre_cuenta']).agg({'debe': 'sum', 'haber': 'sum'}).reset_index()
-        df_gas['Total'] = df_gas['debe'] - df_gas['haber']
-        tot_gas = df_gas['Total'].sum()
+    meses_nombres = {"01":"Enero", "02":"Febrero", "03":"Marzo", "04":"Abril", "05":"Mayo", "06":"Junio", "07":"Julio", "08":"Agosto", "09":"Septiembre", "10":"Octubre", "11":"Noviembre", "12":"Diciembre"}
 
-        utilidad_bruta = tot_ing - tot_gas
+    if modo_er == "🌐 Histórico Acumulado (Mes a Mes)":
+        q_er_acum = """
+            SELECT d.codigo_cuenta, d.nombre_cuenta, n.tipo,
+                   SUBSTRING(d.fecha FROM 6 FOR 2) AS mes,
+                   SUM(CASE WHEN n.tipo = 'Ingreso' THEN (d.haber - d.debe) ELSE (d.debe - d.haber) END) AS total_mov
+            FROM libro_diario d
+            JOIN nomenclatura n ON d.codigo_cuenta = n.codigo AND d.empresa_id = n.empresa_id
+            WHERE d.empresa_id = %s AND SUBSTRING(d.fecha FROM 1 FOR 4) = %s AND n.tipo IN ('Ingreso', 'Gasto')
+            GROUP BY d.codigo_cuenta, d.nombre_cuenta, n.tipo, SUBSTRING(d.fecha FROM 6 FOR 2)
+            ORDER BY d.codigo_cuenta
+        """
+        df_er_raw = pd.read_sql_query(q_er_acum, conn, params=(str(selected_emp_id), str(anio_er)))
+        conn.close()
 
-        # Estimación de impuesto
-        regimen = selected_empresa_info[3] or "General"
-        if "Pequeño" in regimen:
-            impuesto = round(tot_ing * 0.05, 2)
-        elif "Opcional" in regimen or "Simplificado" in regimen:
-            impuesto = round(tot_ing * 0.05, 2) if tot_ing <= 30000 else round(1500 + (tot_ing - 30000) * 0.07, 2)
+        if not df_er_raw.empty:
+            cols_meses_keys = sorted(meses_nombres.keys())
+            
+            # Pivot table estructurada de arriba hacia abajo
+            # 1. Ingresos
+            df_i = df_er_raw[df_er_raw['tipo'] == 'Ingreso'].pivot_table(index=['codigo_cuenta', 'nombre_cuenta'], columns='mes', values='total_mov', aggfunc='sum', fill_value=0.0).reset_index()
+            # 2. Costo de ventas (5.1.01)
+            df_c = df_er_raw[(df_er_raw['tipo'] == 'Gasto') & (df_er_raw['codigo_cuenta'].str.startswith('5.1.01'))].pivot_table(index=['codigo_cuenta', 'nombre_cuenta'], columns='mes', values='total_mov', aggfunc='sum', fill_value=0.0).reset_index()
+            # 3. Gastos operativos
+            df_g = df_er_raw[(df_er_raw['tipo'] == 'Gasto') & (~df_er_raw['codigo_cuenta'].str.startswith('5.1.01'))].pivot_table(index=['codigo_cuenta', 'nombre_cuenta'], columns='mes', values='total_mov', aggfunc='sum', fill_value=0.0).reset_index()
+
+            filas_er_matriz = []
+            
+            # Función auxiliar para renglones
+            def agregar_bloque(df_sub, nombre_bloque):
+                if not df_sub.empty:
+                    for m in cols_meses_keys:
+                        if m not in df_sub.columns: df_sub[m] = 0.0
+                    for _, r in df_sub.iterrows():
+                        fila = {"Rubro Contable": f"{r['codigo_cuenta']} - {r['nombre_cuenta']}", "Sección": nombre_bloque}
+                        for m in cols_meses_keys: fila[m] = float(r[m])
+                        fila['TOTAL ACUMULADO (Q)'] = sum([fila[m] for m in cols_meses_keys])
+                        filas_er_matriz.append(fila)
+
+            # Renglones formales
+            agregar_bloque(df_i, "(+) INGRESOS OPERACIONALES")
+            agregar_bloque(df_c, "(-) COSTO DE VENTAS")
+            agregar_bloque(df_g, "(-) GASTOS OPERATIVOS")
+
+            # Totales calculados mes a mes
+            fila_ing_tot = {"Rubro Contable": "TOTAL INGRESOS BRUTOS", "Sección": "RESUMEN"}
+            fila_cost_tot = {"Rubro Contable": "TOTAL COSTO DE VENTAS", "Sección": "RESUMEN"}
+            fila_bruta = {"Rubro Contable": "(=) UTILIDAD BRUTA EN VENTAS", "Sección": "RESUMEN"}
+            fila_gas_tot = {"Rubro Contable": "TOTAL GASTOS OPERATIVOS", "Sección": "RESUMEN"}
+            fila_op = {"Rubro Contable": "(=) UTILIDAD DE OPERACIÓN", "Sección": "RESUMEN"}
+            fila_isr = {"Rubro Contable": f"(-) PROVISIÓN ISR ({selected_empresa_info[3]})", "Sección": "IMPUESTO"}
+            fila_neta = {"Rubro Contable": "(=) UTILIDAD NETA DEL EJERCICIO", "Sección": "RESULTADO NETO"}
+
+            for m in cols_meses_keys:
+                sub_m = df_er_raw[df_er_raw['mes'] == m]
+                ing_m = sub_m[sub_m['tipo'] == 'Ingreso']['total_mov'].sum()
+                cost_m = sub_m[(sub_m['tipo'] == 'Gasto') & (sub_m['codigo_cuenta'].str.startswith('5.1.01'))]['total_mov'].sum()
+                gas_m = sub_m[(sub_m['tipo'] == 'Gasto') & (~sub_m['codigo_cuenta'].str.startswith('5.1.01'))]['total_mov'].sum()
+                
+                bruta_m = ing_m - cost_m
+                op_m = bruta_m - gas_m
+                imp_m, net_m, _ = calcular_impuesto_renta(selected_empresa_info[3], ing_m, op_m)
+
+                fila_ing_tot[m] = ing_m
+                fila_cost_tot[m] = cost_m
+                fila_bruta[m] = bruta_m
+                fila_gas_tot[m] = gas_m
+                fila_op[m] = op_m
+                fila_isr[m] = imp_m
+                fila_neta[m] = net_m
+
+            for item in [fila_ing_tot, fila_cost_tot, fila_bruta, fila_gas_tot, fila_op, fila_isr, fila_neta]:
+                item['TOTAL ACUMULADO (Q)'] = sum([item[m] for m in cols_meses_keys])
+                filas_er_matriz.append(item)
+
+            df_er_display = pd.DataFrame(filas_er_matriz)
+            df_er_display.rename(columns=meses_nombres, inplace=True)
+            st.dataframe(df_er_display, use_container_width=True)
+
+            er_xls = io.BytesIO()
+            df_er_display.to_excel(er_xls, index=False, engine='openpyxl')
+            st.download_button("📥 Descargar Estado de Resultados Matricial en Excel (.xlsx)", er_xls.getvalue(), f"Estado_Resultados_Acumulado_{anio_er}.xlsx")
         else:
-            impuesto = round(max(0.0, utilidad_bruta * 0.25), 2)
-
-        utilidad_neta = round(utilidad_bruta - impuesto, 2)
-
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("(+) Ingresos Operacionales", f"Q {tot_ing:,.2f}")
-        c2.metric("(-) Gastos y Costos", f"Q {tot_gas:,.2f}")
-        c3.metric("(-) Provisión ISR Estimado", f"Q {impuesto:,.2f}")
-        c4.metric("(=) Utilidad Neta Ejercicio", f"Q {utilidad_neta:,.2f}")
-
-        # Tabla estructurada
-        filas_er = []
-        filas_er.append({"Sección": "INGRESOS", "Cuenta": "Total Ingresos Brutos", "Monto (Q)": tot_ing})
-        for _, r in df_ing.iterrows():
-            filas_er.append({"Sección": "INGRESOS", "Cuenta": f"{r['codigo_cuenta']} - {r['nombre_cuenta']}", "Monto (Q)": r['Total']})
-        filas_er.append({"Sección": "GASTOS", "Cuenta": "Total Costos y Gastos", "Monto (Q)": tot_gas})
-        for _, r in df_gas.iterrows():
-            filas_er.append({"Sección": "GASTOS", "Cuenta": f"{r['codigo_cuenta']} - {r['nombre_cuenta']}", "Monto (Q)": r['Total']})
-        filas_er.append({"Sección": "RESULTADO", "Cuenta": "Utilidad de Operación", "Monto (Q)": utilidad_bruta})
-        filas_er.append({"Sección": "IMPUESTOS", "Cuenta": f"Provisión ISR ({regimen})", "Monto (Q)": impuesto})
-        filas_er.append({"Sección": "RESULTADO NETO", "Cuenta": "Ganancia Neta del Período", "Monto (Q)": utilidad_neta})
-
-        df_er_tab = pd.DataFrame(filas_er)
-        st.dataframe(df_er_tab, use_container_width=True)
-
-        col_er1, col_er2 = st.columns(2)
-        buff_er_xls = io.BytesIO()
-        df_er_tab.to_excel(buff_er_xls, index=False, engine='openpyxl')
-        col_er1.download_button("📥 Descargar Estado de Resultados en Excel (.xlsx)", buff_er_xls.getvalue(), f"Estado_Resultados_{selected_empresa_info[2]}.xlsx")
-        pdf_er = exportar_reporte_pdf(df_er_tab, "Estado de Resultados Oficial", selected_empresa_info[1], selected_empresa_info[2])
-        col_er2.download_button("📄 Descargar Estado de Resultados en PDF", pdf_er, f"Estado_Resultados_{selected_empresa_info[2]}.pdf", "application/pdf")
+            st.info("Sin operaciones registradas en este ejercicio fiscal.")
     else:
-        st.info("Sin transacciones de ingresos o gastos para calcular resultados.")
+        cond_er = "d.empresa_id = %s AND SUBSTRING(d.fecha FROM 1 FOR 4) = %s"
+        params_er = [str(selected_emp_id), str(anio_er)]
+        lbl_periodo = f"Año Fiscal Completo {anio_er}"
+        if modo_er == "📅 Mes Específico":
+            mes_er = st.selectbox("Seleccionar Mes:", list(meses_nombres.keys()), format_func=lambda x: f"{x} - {meses_nombres[x]}", key="er_mes_sel")
+            cond_er += " AND SUBSTRING(d.fecha FROM 6 FOR 2) = %s"
+            params_er.append(mes_er)
+            lbl_periodo = f"{meses_nombres[mes_er]} {anio_er}"
+
+        q_er_p = f"""
+            SELECT d.codigo_cuenta AS "Código", d.nombre_cuenta AS "Cuenta", n.tipo,
+                   SUM(CASE WHEN n.tipo = 'Ingreso' THEN (d.haber - d.debe) ELSE (d.debe - d.haber) END) AS "Monto (Q)"
+            FROM libro_diario d
+            JOIN nomenclatura n ON d.codigo_cuenta = n.codigo AND d.empresa_id = n.empresa_id
+            WHERE {cond_er} AND n.tipo IN ('Ingreso', 'Gasto')
+            GROUP BY d.codigo_cuenta, d.nombre_cuenta, n.tipo
+            ORDER BY d.codigo_cuenta
+        """
+        df_er_p = pd.read_sql_query(q_er_p, conn, params=tuple(params_er))
+        conn.close()
+
+        if not df_er_p.empty:
+            tot_i = df_er_p[df_er_p['tipo'] == 'Ingreso']['Monto (Q)'].sum()
+            tot_c = df_er_p[(df_er_p['tipo'] == 'Gasto') & (df_er_p['Código'].str.startswith('5.1.01'))]['Monto (Q)'].sum()
+            tot_g = df_er_p[(df_er_p['tipo'] == 'Gasto') & (~df_er_p['Código'].str.startswith('5.1.01'))]['Monto (Q)'].sum()
+
+            utilidad_bruta = tot_i - tot_c
+            utilidad_op = utilidad_bruta - tot_g
+            impuesto, ganancia_neta, tasa_desc = calcular_impuesto_renta(selected_empresa_info[3], tot_i, utilidad_op)
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("(+) Ingresos Operacionales", f"Q {tot_i:,.2f}")
+            c2.metric("(=) Utilidad Bruta", f"Q {utilidad_bruta:,.2f}")
+            c3.metric(f"(-) Provisión ISR ({tasa_desc})", f"Q {impuesto:,.2f}")
+            c4.metric("(=) Ganancia Neta Ejercicio", f"Q {ganancia_neta:,.2f}", delta="Ganancia" if ganancia_neta >= 0 else "Pérdida")
+
+            st.markdown("---")
+            filas_verticales = [
+                {"Estructura": "INGRESOS", "Concepto": "Total Ingresos Operacionales", "Monto (Q)": tot_i},
+                {"Estructura": "COSTOS", "Concepto": "(-) Costo de Ventas", "Monto (Q)": tot_c},
+                {"Estructura": "MARGEN", "Concepto": "(=) Utilidad Bruta en Ventas", "Monto (Q)": utilidad_bruta},
+                {"Estructura": "GASTOS", "Concepto": "(-) Gastos de Operación y Administración", "Monto (Q)": tot_g},
+                {"Estructura": "OPERACIÓN", "Concepto": "(=) Utilidad en Operación", "Monto (Q)": utilidad_op},
+                {"Estructura": "IMPUESTOS", "Concepto": f"(-) Provisión ISR ({tasa_desc})", "Monto (Q)": impuesto},
+                {"Estructura": "RESULTADO NETO", "Concepto": "(=) Utilidad Neta del Ejercicio", "Monto (Q)": ganancia_neta}
+            ]
+            df_er_vert = pd.DataFrame(filas_verticales)
+            st.dataframe(df_er_vert, use_container_width=True)
+
+            col_de1, col_de2 = st.columns(2)
+            er_xls2 = io.BytesIO()
+            df_er_vert.to_excel(er_xls2, index=False, engine='openpyxl')
+            col_de1.download_button("📥 Descargar Estado de Resultados en Excel (.xlsx)", er_xls2.getvalue(), f"Estado_Resultados_{lbl_periodo}.xlsx")
+            pdf_er = exportar_reporte_pdf(df_er_vert, f"Estado de Resultados Oficial - {lbl_periodo}", selected_empresa_info[1], selected_empresa_info[2])
+            col_de2.download_button("📄 Descargar Estado de Resultados en PDF", pdf_er, f"Estado_Resultados_{lbl_periodo}.pdf", "application/pdf")
+        else:
+            st.info("Sin operaciones registradas en el período.")
 
 # ==========================================
 # 17. NOMENCLATURA CONTABLE
@@ -1526,8 +1636,6 @@ elif selected_menu == "🗂️ Nomenclatura Contable":
 
     if not df_nom.empty:
         st.dataframe(df_nom, use_container_width=True)
-    else:
-        st.info("No hay cuentas contables registradas.")
 
     with st.expander("➕ Crear Nueva Cuenta Contable"):
         with st.form("form_nueva_cta"):
@@ -1537,22 +1645,17 @@ elif selected_menu == "🗂️ Nomenclatura Contable":
             tip_c = c3.selectbox("Clasificación:", ["Activo", "Pasivo", "Capital", "Ingreso", "Gasto"])
             if st.form_submit_button("Guardar Cuenta", type="primary"):
                 if cod_c.strip() and nom_c.strip():
-                    conn = get_db_connection()
-                    c = conn.cursor()
+                    conn = get_db_connection(); c = conn.cursor()
                     c.execute("INSERT INTO nomenclatura (empresa_id, codigo, nombre, tipo) VALUES (%s, %s, %s, %s)",
                               (str(selected_emp_id), cod_c.strip(), nom_c.strip(), tip_c))
-                    conn.commit()
-                    conn.close()
-                    st.success("Cuenta agregada a la nomenclatura.")
-                    st.rerun()
+                    conn.commit(); conn.close()
+                    st.success("Cuenta agregada exitosamente."); st.rerun()
 
 # ==========================================
 # 18. CONTROL DE USUARIOS (ADMIN)
 # ==========================================
 elif selected_menu == "👤 Control de Usuarios (Admin)":
-    if not is_admin:
-        st.error("Acceso restringido únicamente para Administrador.")
-        st.stop()
+    if not is_admin: st.error("Acceso restringido."); st.stop()
     st.title("👤 Control de Usuarios del Sistema")
     conn = get_db_connection()
     df_users = pd.read_sql_query("SELECT id, username AS 'Usuario', name AS 'Nombre', email AS 'Correo', role AS 'Rol', status AS 'Estado', assigned_empresas AS 'Empresas Asignadas' FROM users ORDER BY name", conn)
@@ -1563,9 +1666,7 @@ elif selected_menu == "👤 Control de Usuarios (Admin)":
 # 19. GESTIÓN DE EMPRESAS (ADMIN)
 # ==========================================
 elif selected_menu == "🏢 Gestión de Empresas (Admin)":
-    if not is_admin:
-        st.error("Acceso restringido para Administrador.")
-        st.stop()
+    if not is_admin: st.error("Acceso restringido."); st.stop()
     st.title("🏢 Gestión de Empresas")
     conn = get_db_connection()
     df_e = pd.read_sql_query("SELECT id, nombre AS 'Razón Social', nit AS 'NIT', regimen_isr AS 'Régimen ISR' FROM empresas ORDER BY nombre", conn)
@@ -1573,8 +1674,6 @@ elif selected_menu == "🏢 Gestión de Empresas (Admin)":
 
     if not df_e.empty:
         st.dataframe(df_e, use_container_width=True)
-    else:
-        st.info("No hay empresas registradas.")
 
     with st.expander("➕ Registrar Nueva Empresa"):
         with st.form("form_reg_empresa"):
@@ -1584,15 +1683,12 @@ elif selected_menu == "🏢 Gestión de Empresas (Admin)":
             reg_emp = c3.selectbox("Régimen Fiscal:", ["Pequeño Contribuyente (5%)", "Opcional Simplificado (5% / 7%)", "General sobre Utilidades (25%)"])
             if st.form_submit_button("Guardar Empresa", type="primary"):
                 if nom_emp.strip() and nit_emp.strip():
-                    conn = get_db_connection()
-                    c = conn.cursor()
+                    conn = get_db_connection(); c = conn.cursor()
                     emp_uid = f"emp-{int(datetime.now().timestamp())}"
                     c.execute("""
                         INSERT INTO empresas (id, nombre, nit, direccion, telefono, regimen_isr, actividad_economica, created_at)
                         VALUES (%s, %s, %s, 'Guatemala', '', %s, 'General', %s)
                     """, (emp_uid, nom_emp.strip(), nit_emp.strip().upper(), reg_emp, datetime.now().isoformat()))
-                    conn.commit()
-                    conn.close()
+                    conn.commit(); conn.close()
                     sembrar_nomenclatura_inicial(emp_uid)
-                    st.success("Empresa creada y configurada exitosamente.")
-                    st.rerun()
+                    st.success("Empresa creada y configurada exitosamente."); st.rerun()
