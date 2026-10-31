@@ -643,8 +643,9 @@ elif selected_menu == "📈 Factura de Ventas":
             st.table(pd.DataFrame(partida_v))
 
             if st.form_submit_button("Guardar Factura de Venta y Asentar", type="primary"):
-                if not num_fac or not cli_nombre or not cli_nit or float(total) <= 0:
-                    st.error("⚠️ Completa los campos obligatorios: Número DTE, Cliente, NIT y Total válido.")
+                # Se valida contra subtotal o el monto ingresado
+                if not num_fac or not cli_nombre or not cli_nit or float(subtotal) <= 0:
+                    st.error("⚠️ Completa los campos obligatorios: Número DTE, Cliente, NIT y un monto mayor a 0.")
                 else:
                     try:
                         conn = get_db_connection()
@@ -679,13 +680,13 @@ elif selected_menu == "📈 Factura de Ventas":
                         cod_d, nom_d = cuenta_debe_cobro.split(" - ", 1) if " - " in cuenta_debe_cobro else (cuenta_debe_cobro, cuenta_debe_cobro)
                         cod_h, nom_h = cuenta_haber_ingreso.split(" - ", 1) if " - " in cuenta_haber_ingreso else (cuenta_haber_ingreso, cuenta_haber_ingreso)
 
-                        # Consulta universal con columna referencia_id (Supabase)
+                        # Consulta para Supabase (con columna referencia_id)
                         q_ld = """
                             INSERT INTO libro_diario (empresa_id, partida_no, fecha, codigo_cuenta, nombre_cuenta, debe, haber, concepto, referencia_id, created_at)
                             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """
 
-                        # Renglón 1: Cobro en Caja / Bancos (Debe)
+                        # Renglón 1: Cargo a Caja / Cobro (Debe)
                         c.execute(q_ld, (str(selected_emp_id), p_no, str(fecha_fac), str(cod_d), str(nom_d), float(liq), 0.0, glosa, str(num_fac), str(now_str)))
 
                         # Renglón 2: Retención ISR si aplica (Debe)
@@ -696,16 +697,16 @@ elif selected_menu == "📈 Factura de Ventas":
                         if float(m_iva) > 0:
                             c.execute(q_ld, (str(selected_emp_id), p_no, str(fecha_fac), '1.1.03.03', 'Constancias Retención IVA', float(m_iva), 0.0, glosa, str(num_fac), str(now_str)))
 
-                        # Renglón 4: Ingreso por Transporte / Ventas (Haber)
+                        # Renglón 4: Abono a Ingreso / Transporte (Haber)
                         c.execute(q_ld, (str(selected_emp_id), p_no, str(fecha_fac), str(cod_h), str(nom_h), 0.0, float(subtotal), glosa, str(num_fac), str(now_str)))
 
-                        # Renglón 5: IVA Débito Fiscal si aplica (Haber)
+                        # Renglón 5: IVA por Pagar si aplica (Haber)
                         if float(iva) > 0:
                             c.execute(q_ld, (str(selected_emp_id), p_no, str(fecha_fac), '2.1.02.01', 'IVA por Pagar (Débito Fiscal)', 0.0, float(iva), glosa, str(num_fac), str(now_str)))
 
                         conn.commit()
                         conn.close()
-                        st.success("✅ ¡Factura guardada y asentada exitosamente en todos los módulos!")
+                        st.success("✅ Factura de venta guardada y asentada exitosamente.")
                         st.rerun()
 
                     except Exception as err:
