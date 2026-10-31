@@ -1091,7 +1091,15 @@ elif selected_menu == "📦 Control de Inventarios (Kárdex)":
         );
     """)
     conn.commit()
-    df_prod = pd.read_sql_query("SELECT id, codigo AS 'Código', descripcion AS 'Descripción', existencia AS 'Existencia', costo_promedio AS 'Costo Promedio (Q)', precio_venta AS 'Precio Venta Ref. (Q)' FROM productos ORDER BY codigo", conn)
+    df_prod = pd.read_sql_query('SELECT id, codigo, descripcion, existencia, costo_promedio, precio_venta FROM productos ORDER BY codigo', conn)
+    if not df_prod.empty:
+        df_prod = df_prod.rename(columns={
+            'codigo': 'Código',
+            'descripcion': 'Descripción',
+            'existencia': 'Existencia',
+            'costo_promedio': 'Costo Promedio (Q)',
+            'precio_venta': 'Precio Venta Ref. (Q)'
+        })
     conn.close()
 
     if not df_prod.empty:
