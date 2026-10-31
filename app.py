@@ -642,75 +642,163 @@ elif selected_menu == "📈 Factura de Ventas":
             if iva_v > 0: partida_v.append({"Cuenta": "2.1.02.01 - IVA por Pagar", "DEBE": "Q 0.00", "HABER": f"Q {iva_v:,.2f}"})
             st.table(pd.DataFrame(partida_v))
 
-            if st.form_submit_button("Guardar Factura de Venta y Asentar", type="primary"):
-                # Se valida contra subtotal o el monto ingresado
-                if not num_fac or not cli_nombre or not cli_nit or float(subtotal) <= 0:
-                    st.error("⚠️ Completa los campos obligatorios: Número DTE, Cliente, NIT y un monto mayor a 0.")
+            elif selected_menu in ["📈 Factura de Ventas", "📈 Facturación de Ventas"]:
+    if not selected_emp_id:
+        st.warning("Selecciona una empresa primero.")
+        st.stop()
+        
+    st.title(f"📈 Facturación de Ventas Emitidas — {selected_empresa_info[1]}")
+    
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT codigo, nombre FROM nomenclatura WHERE empresa_id = %s AND tipo = 'Ingreso' ORDER BY codigo", (str(selected_emp_id),))
+    cuentas_ing = c.fetchall()
+    c.execute("SELECT codigo, nombre FROM nomenclatura WHERE empresa_id = %s AND (tipo = 'Activo' OR tipo = 'Pasivo') ORDER BY codigo", (str(selected_emp_id),))
+    cuentas_cobro = c.fetchall()
+    conn.close()
+    
+    opciones_haber = [f"{r[0]} - {r[1]}" for r in cuentas_ing]
+    opciones_debe = [f"{r[0]} - {r[1]}" for r in cuentas_cobro]
+    
+    t_emitir, t_historial = st.tabs(["➕ Emitir Factura de Venta", "📋 Modificar / Corregir Factura"])
+    
+    with t_emitir:
+        with st.form("form_venta_seguro"):
+            col_f1, col_f2, col_f3 = st.columns(3)
+            v_num = col_f1.text_input("Número Factura / DTE Emitido *", key="v_num_input")
+            v_serie = col_f2.text_input("Serie", key="v_ser_input")
+            v_fecha = col_f3.date_input("Fecha de Emisión", value=date.today(), key="v_fec_input")
+            
+            col_c1, col_c2 = st.columns(2)
+            v_cli_nom = col_c1.text_input("Nombre / Razón Social del Cliente *", value="CONSUMIDOR FINAL", key="v_nom_input")
+            v_cli_nit = col_c2.text_input("NIT del Cliente *", value="CF", key="v_nit_input")
+            
+            st.markdown("---")
+            col_cta1, col_cta2 = st.columns(2)
+            v_cta_debe = col_cta1.selectbox("Cuenta de Cobro / DEBE (Caja / Banco / Cliente) *", opciones_debe if opciones_debe else ["1.1.01.01 - Caja General (Efectivo)"], key="v_cdebe_sel")
+            
+            # Buscar por defecto la cuenta de transporte o ventas
+            idx_hab = next((i for i, x in enumerate(opciones_haber) if "4.1.01.03" in x or "Transporte" in x), 0)
+            v_cta_haber = col_cta2.selectbox("Cuenta de Ingreso / HABER *", opciones_haber if opciones_haber else ["4.1.01.03 - Servicios de Transporte y Fletes"], index=idx_hab, key="v_chaber_sel")
+            
+            v_subtotal = st.number_input("Monto / Subtotal Factura (Q) *", min_value=0.0, step=50.0, format="%.2f", value=300.0, key="v_sub_val")
+            
+            es_pequeno = st.checkbox("¿Régimen Pequeño Contribuyente? (No genera débito fiscal IVA)", value=True, key="v_peq_chk")
+            
+            col_ret1, col_ret2 = st.columns(2)
+            ret_isr_chk = col_ret1.checkbox("Cliente practicó Retención de ISR", value=False, key="v_risr_chk")
+            tasa_isr_sel = col_ret1.selectbox("Tasa ISR Retenida", ["No Aplica", "5% General", "7% Excedente (Sobre Q30k)"], key="v_tisr_sel")
+            
+            ret_iva_chk = col_ret2.checkbox("Cliente practicó Retención de IVA", value=False, key="v_riva_chk")
+            tasa_iva_sel = col_ret2.selectbox("Tasa IVA Retenida", ["No Aplica / No es Agente Retenedor", "15% Retención IVA", "100% Retención Total IVA"], key="v_tiva_sel")
+            
+            # Cálculos automáticos seguros
+            monto_base = float(v_subtotal)
+            monto_iva = 0.0 if es_pequeno else round(monto_base * 0.12, 2)
+            monto_total = monto_base if es_pequeno else round(monto_base + monto_iva, 2)
+            
+            m_isr = 0.0
+            if ret_isr_chk and monto_base >= 2800.0 and tasa_isr_sel != "No Aplica":
+                m_isr = round(monto_base * 0.05, 2) if "5%" in tasa_isr_sel else round(1500.0 + (monto_base - 30000.0) * 0.07, 2)
+                
+            m_iva = 0.0
+            if ret_iva_chk and monto_iva > 0 and "No Aplica" not in tasa_iva_sel:
+                m_iva = round(monto_iva * 0.15, 2) if "15%" in tasa_iva_sel else round(monto_iva, 2)
+                
+            liquido = round(monto_total - m_isr - m_iva, 2)
+            
+            st.markdown(f"**Base Imponible:** Q {monto_base:,.2f} | **IVA Débito:** Q {monto_iva:,.2f} | **Líquido a Recibir:** Q {liquido:,.2f}")
+            
+            # Previsualización de Partida
+            prev_rows = [
+                {"Cuenta": v_cta_debe, "DEBE": f"Q {liquido:,.2f}", "HABER": "Q 0.00"},
+                {"Cuenta": v_cta_haber, "DEBE": "Q 0.00", "HABER": f"Q {monto_base:,.2f}"}
+            ]
+            if m_isr > 0:
+                prev_rows.append({"Cuenta": "1.1.03.02 - ISR Retenido por Acreditar", "DEBE": f"Q {m_isr:,.2f}", "HABER": "Q 0.00"})
+            if m_iva > 0:
+                prev_rows.append({"Cuenta": "1.1.03.03 - Constancias Retención IVA", "DEBE": f"Q {m_iva:,.2f}", "HABER": "Q 0.00"})
+            if monto_iva > 0:
+                prev_rows.append({"Cuenta": "2.1.02.01 - IVA por Pagar", "DEBE": "Q 0.00", "HABER": f"Q {monto_iva:,.2f}"})
+            st.table(pd.DataFrame(prev_rows))
+            
+            btn_guardar_venta = st.form_submit_button("Guardar Factura de Venta y Asentar", type="primary")
+            
+            if btn_guardar_venta:
+                if not v_num.strip() or not v_cli_nom.strip() or not v_cli_nit.strip() or monto_base <= 0:
+                    st.error("⚠️ Completa el Número de DTE, Cliente, NIT y un monto mayor a 0.")
                 else:
                     try:
                         conn = get_db_connection()
                         c = conn.cursor()
-                        
-                        fac_id = f"fac-v-{int(datetime.now().timestamp())}"
                         now_str = datetime.now().isoformat()
+                        fac_id = f"fac-v-{int(datetime.now().timestamp())}"
                         
-                        # 1. Inserción protegida en facturas
-                        c.execute('''
+                        # 1. Inserción en facturas
+                        c.execute("""
                             INSERT INTO facturas (
                                 id, empresa_id, tipo, numero_factura, serie, fecha,
                                 tercero_nombre, tercero_nit, descripcion, tipo_gasto_ingreso,
                                 subtotal, iva, total, aplica_ret_isr, tasa_ret_isr, monto_ret_isr,
                                 aplica_ret_iva, tasa_ret_iva, monto_ret_iva, total_a_pagar_cobrar,
-                                created_by, created_at, estado_pago, saldo_pendiente, forma_pago, cuenta_pago
-                            ) VALUES (%s, %s, 'VENTA', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'PAGADO', 0.0, 'Contado', %s)
-                        ''', (
-                            str(fac_id), str(selected_emp_id), str(num_fac).strip(), str(serie).strip(), str(fecha_fac),
-                            str(cli_nombre).strip(), str(cli_nit).strip(), "Venta de Servicios / Transporte", "Ingreso",
-                            float(subtotal), float(iva), float(total),
-                            1 if aplica_isr else 0, float(t_isr), float(m_isr),
-                            1 if aplica_iva else 0, float(t_iva), float(m_iva),
-                            float(liq), str(curr_u['username']), str(now_str), str(cuenta_debe_cobro)
+                                saldo_pendiente, estado_pago, created_by, created_at,
+                                cuenta_nomenclatura, cuenta_pago, forma_pago
+                            ) VALUES (%s, %s, 'VENTA', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0.0, 'PAGADO', %s, %s, %s, %s, 'Contado')
+                        """, (
+                            fac_id, str(selected_emp_id), str(v_num).strip(), str(v_serie).strip(), str(v_fecha),
+                            str(v_cli_nom).strip(), str(v_cli_nit).strip().upper(), "Venta / Transporte", "Ingreso",
+                            float(monto_base), float(monto_iva), float(monto_total),
+                            1 if ret_isr_chk else 0, 0.05 if ret_isr_chk else 0.0, float(m_isr),
+                            1 if ret_iva_chk else 0, 0.15 if ret_iva_chk else 0.0, float(m_iva),
+                            float(liquido), str(curr_u['username']), str(now_str),
+                            str(v_cta_haber), str(v_cta_debe)
                         ))
-
-                        # 2. Correlativo de partida en Libro Diario
+                        
+                        # 2. Partida en libro_diario
                         c.execute("SELECT COALESCE(MAX(partida_no), 0) + 1 FROM libro_diario WHERE empresa_id = %s", (str(selected_emp_id),))
                         p_no = int(c.fetchone()[0])
-                        glosa = f"Factura Venta {num_fac} a {cli_nombre}"
-
-                        cod_d, nom_d = cuenta_debe_cobro.split(" - ", 1) if " - " in cuenta_debe_cobro else (cuenta_debe_cobro, cuenta_debe_cobro)
-                        cod_h, nom_h = cuenta_haber_ingreso.split(" - ", 1) if " - " in cuenta_haber_ingreso else (cuenta_haber_ingreso, cuenta_haber_ingreso)
-
-                        # Consulta para Supabase (con columna referencia_id)
-                        q_ld = """
+                        glosa = f"Factura Venta {v_num} a {v_cli_nom}"
+                        
+                        cod_d, nom_d = v_cta_debe.split(" - ", 1) if " - " in v_cta_debe else (v_cta_debe, v_cta_debe)
+                        cod_h, nom_h = v_cta_haber.split(" - ", 1) if " - " in v_cta_haber else (v_cta_haber, v_cta_haber)
+                        
+                        q_diario = """
                             INSERT INTO libro_diario (empresa_id, partida_no, fecha, codigo_cuenta, nombre_cuenta, debe, haber, concepto, referencia_id, created_at)
                             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """
-
-                        # Renglón 1: Cargo a Caja / Cobro (Debe)
-                        c.execute(q_ld, (str(selected_emp_id), p_no, str(fecha_fac), str(cod_d), str(nom_d), float(liq), 0.0, glosa, str(num_fac), str(now_str)))
-
-                        # Renglón 2: Retención ISR si aplica (Debe)
-                        if float(m_isr) > 0:
-                            c.execute(q_ld, (str(selected_emp_id), p_no, str(fecha_fac), '1.1.03.02', 'ISR Retenido por Acreditar', float(m_isr), 0.0, glosa, str(num_fac), str(now_str)))
-
-                        # Renglón 3: Retención IVA si aplica (Debe)
-                        if float(m_iva) > 0:
-                            c.execute(q_ld, (str(selected_emp_id), p_no, str(fecha_fac), '1.1.03.03', 'Constancias Retención IVA', float(m_iva), 0.0, glosa, str(num_fac), str(now_str)))
-
-                        # Renglón 4: Abono a Ingreso / Transporte (Haber)
-                        c.execute(q_ld, (str(selected_emp_id), p_no, str(fecha_fac), str(cod_h), str(nom_h), 0.0, float(subtotal), glosa, str(num_fac), str(now_str)))
-
-                        # Renglón 5: IVA por Pagar si aplica (Haber)
-                        if float(iva) > 0:
-                            c.execute(q_ld, (str(selected_emp_id), p_no, str(fecha_fac), '2.1.02.01', 'IVA por Pagar (Débito Fiscal)', 0.0, float(iva), glosa, str(num_fac), str(now_str)))
-
+                        # Debe (Caja / Cobro)
+                        c.execute(q_diario, (str(selected_emp_id), p_no, str(v_fecha), str(cod_d), str(nom_d), float(liquido), 0.0, glosa, str(v_num), str(now_str)))
+                        if m_isr > 0:
+                            c.execute(q_diario, (str(selected_emp_id), p_no, str(v_fecha), '1.1.03.02', 'ISR Retenido por Acreditar', float(m_isr), 0.0, glosa, str(v_num), str(now_str)))
+                        if m_iva > 0:
+                            c.execute(q_diario, (str(selected_emp_id), p_no, str(v_fecha), '1.1.03.03', 'Constancias Retención IVA', float(m_iva), 0.0, glosa, str(v_num), str(now_str)))
+                            
+                        # Haber (Ingreso / Transporte)
+                        c.execute(q_diario, (str(selected_emp_id), p_no, str(v_fecha), str(cod_h), str(nom_h), 0.0, float(monto_base), glosa, str(v_num), str(now_str)))
+                        if monto_iva > 0:
+                            c.execute(q_diario, (str(selected_emp_id), p_no, str(v_fecha), '2.1.02.01', 'IVA por Pagar (Débito Fiscal)', 0.0, float(monto_iva), glosa, str(v_num), str(now_str)))
+                            
                         conn.commit()
                         conn.close()
-                        st.success("✅ Factura de venta guardada y asentada exitosamente.")
+                        st.success("✅ Factura guardada y asentada exitosamente en todos los módulos.")
                         st.rerun()
-
                     except Exception as err:
                         st.error(f"❌ Error al guardar en base de datos: {err}")
+
+    with t_historial:
+        conn = get_db_connection()
+        df_ventas = pd.read_sql_query("""
+            SELECT id, fecha, serie, numero_factura, tercero_nombre, tercero_nit, subtotal, iva, total, total_a_pagar_cobrar
+            FROM facturas 
+            WHERE empresa_id = %s AND tipo = 'VENTA' 
+            ORDER BY fecha DESC, created_at DESC
+        """, conn, params=(str(selected_emp_id),))
+        conn.close()
+        
+        if not df_ventas.empty:
+            st.dataframe(df_ventas, use_container_width=True)
+        else:
+            st.info("No hay facturas de ventas para editar.")
 
 # ==========================================
 # 3. FACTURA DE COMPRAS
