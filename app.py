@@ -1208,52 +1208,123 @@ elif selected_menu == "💰 Cuentas por Cobrar (Clientes)":
                     st.success("Cobro registrado y saldos actualizados."); st.rerun()
 
 # ==========================================
-# 8. KÁRDEX / INVENTARIOS
+# 8. KÁRDEX / INVENTARIOS (CORPORATIVO UNIVERSAL)
 # ==========================================
 elif selected_menu == "📦 Control de Inventarios (Kárdex)":
     st.title("📦 Catálogo e Inventario de Productos (Kárdex)")
     conn = get_db_connection()
     c = conn.cursor()
+    # Garantizar que las columnas existan sin conflicto de tipos
     c.execute("""
         CREATE TABLE IF NOT EXISTS productos (
-            id TEXT PRIMARY KEY, codigo TEXT NOT NULL, descripcion TEXT NOT NULL,
-            existencia NUMERIC DEFAULT 0, costo_promedio NUMERIC DEFAULT 0,
-            precio_venta NUMERIC DEFAULT 0, created_at TEXT
+            id TEXT PRIMARY KEY,
+            empresa_id TEXT,
+            codigo TEXT NOT NULL,
+            descripcion TEXT NOT NULL,
+            existencia NUMERIC DEFAULT 0,
+            costo_promedio NUMERIC DEFAULT 0,
+            precio_venta NUMERIC DEFAULT 0,
+            created_at TEXT
         );
     """)
     conn.commit()
-    df_prod = pd.read_sql_query('SELECT id, codigo, descripcion, existencia, costo_promedio, precio_venta FROM productos ORDER BY codigo', conn)
-    if not df_prod.empty:
-        df_prod = df_prod.rename(columns={
-            'codigo': 'Código',
-            'descripcion': 'Descripción',
-            'existencia': 'Existencia',
-            'costo_promedio': 'Costo Promedio (Q)',
-            'precio_venta': 'Precio Venta Ref. (Q)'
-        })
+
+    # Detectar columnas reales de la tabla productos en Supabase
+    c.execute("SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'productos'")
+    info_cols = c.fetchall()
+    nombres_cols = [r[0].lower() for r in info_cols]
+    dict_tipos = {r[0].lower(): r[1].lower() for r in info_cols}
+
+    # Leer productos existentes de forma limpia
+    df_prod = pd.read_sql_query("SELECT * FROM productos ORDER BY codigo ASC", conn)
     conn.close()
 
     if not df_prod.empty:
-        st.dataframe(df_prod[['Código', 'Descripción', 'Existencia', 'Costo Promedio (Q)', 'Precio Venta Ref. (Q)']], use_container_width=True)
+        # Renombrar columnas para la vista corporativa
+        cols_mostrar = {}
+        if 'codigo' in df_prod.columns: cols_mostrar['codigo'] = 'Código'
+        if 'descripcion' in df_prod.columns: cols_mostrar['descripcion'] = 'Descripción'
+        if 'existencia' in df_prod.columns: cols_mostrar['existencia'] = 'Existencia'
+        if 'costo_promedio' in df_prod.columns: cols_mostrar['costo_promedio'] = 'Costo Promedio (Q)'
+        if 'precio_venta' in df_prod.columns: cols_mostrar['precio_venta'] = 'Precio Venta Ref. (Q)'
+        
+        df_vista = df_prod.rename(columns=cols_mostrar)
+        cols_finales = [c for c in ['Código', 'Descripción', 'Existencia', 'Costo Promedio (Q)', 'Precio Venta Ref. (Q)'] if c in df_vista.columns]
+        st.dataframe(df_vista[cols_finales], use_container_width=True)
     else:
-        st.info("No hay productos en inventario.")
+        st.info("No hay productos registrados en el catálogo.")
 
-    with st.expander("➕ Crear Nuevo Producto"):
-        with st.form("form_prod"):
+    # Calcular siguiente código correlativo automático
+    prox_cod = "1"
+    if not df_prod.empty and 'codigo' in df_prod.columns:
+        try:
+            numeros = [int(re.sub(r'\D', '', str(x))) for x in df_prod['codigo'] if re.sub(r'\D', '', str(x))]
+            if numeros:
+                prox_cod = str(max(numeros) + 1)
+        except Exception:
+            prox_cod = str(len(df_prod) + 1)
+
+    with st.expander("➕ Crear Nuevo Producto en Catálogo"):
+        with st.form("form_prod_corporativo"):
             c1, c2 = st.columns(2)
-            pcod = c1.text_input("Código *", value="1")
-            pdesc = c2.text_input("Descripción *")
+            pcod = c1.text_input("Código de Artículo (Secuencia 1 - 1,000,000) *", value=prox_cod)
+            pdesc = c2.text_input("Descripción del Producto *", placeholder="Ej. Transporte de mercadería / Producto X")
             c3, c4, c5 = st.columns(3)
-            pexi = c3.number_input("Existencia:", min_value=0.0, step=1.0)
-            pcost = c4.number_input("Costo Unitario (Q):", min_value=0.0, step=10.0)
-            pprec = c5.number_input("Precio Venta (Q):", min_value=0.0, step=10.0)
-            if st.form_submit_button("Guardar Producto", type="primary"):
+            pexi = c3.number_input("Existencia Inicial:", min_value=0.0, step=1.0, value=0.0)
+            pcost = c4.number_input("Costo Unitario Referencial (Q):", min_value=0.0, step=10.0, value=0.0)
+            pprec = c5.number_input("Precio Venta Sugerido (Q):", min_value=0.0, step=10.0, value=0.0)
+
+            if st.form_submit_button("Guardar Producto en Catálogo", type="primary"):
                 if pcod.strip() and pdesc.strip():
-                    conn = get_db_connection(); c = conn.cursor()
-                    c.execute("INSERT INTO productos VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                              (f"prod-{int(datetime.now().timestamp())}", pcod.strip(), pdesc.strip(), float(pexi), float(pcost), float(pprec), datetime.now().isoformat()))
-                    conn.commit(); conn.close()
-                    st.success("Guardado."); st.rerun()
+                    try:
+                        conn = get_db_connection()
+                        c = conn.cursor()
+                        now_str = datetime.now().isoformat()
+                        ts_num = int(datetime.now().timestamp())
+                        
+                        # Armar inserción dinámica según la estructura real de la tabla
+                        campos = []
+                        valores = []
+                        placeholders = []
+
+                        # Columna 'id'
+                        if 'id' in nombres_cols:
+                            campos.append("id")
+                            placeholders.append("%s")
+                            t_id = dict_tipos.get('id', '')
+                            if "int" in t_id or "serial" in t_id:
+                                # Si id es entero
+                                valores.append(ts_num % 2147483647)
+                            else:
+                                valores.append(f"prod-{ts_num}")
+
+                        # Columna 'empresa_id' si existe en la tabla
+                        if 'empresa_id' in nombres_cols:
+                            campos.append("empresa_id")
+                            placeholders.append("%s")
+                            valores.append(str(selected_emp_id) if selected_emp_id else "global")
+
+                        # Columnas principales
+                        campos.extend(["codigo", "descripcion", "existencia", "costo_promedio", "precio_venta"])
+                        placeholders.extend(["%s", "%s", "%s", "%s", "%s"])
+                        valores.extend([pcod.strip(), pdesc.strip(), float(pexi), float(pcost), float(pprec)])
+
+                        # Columna 'created_at' si existe
+                        if 'created_at' in nombres_cols:
+                            campos.append("created_at")
+                            placeholders.append("%s")
+                            valores.append(now_str)
+
+                        q_insert_prod = f"INSERT INTO productos ({', '.join(campos)}) VALUES ({', '.join(placeholders)})"
+                        c.execute(q_insert_prod, tuple(valores))
+                        conn.commit()
+                        conn.close()
+                        st.success(f"✅ Producto '{pdesc.strip()}' guardado exitosamente con código {pcod.strip()}.")
+                        st.rerun()
+                    except Exception as err:
+                        st.error(f"❌ Error al guardar producto: {err}")
+                else:
+                    st.error("Código y Descripción son obligatorios.")
 
 # ==========================================
 # 9. LIBRO DE COMPRAS (SAT)
