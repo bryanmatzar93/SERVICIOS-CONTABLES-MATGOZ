@@ -843,8 +843,9 @@ elif selected_menu in ["📈 Factura de Ventas", "📈 Facturación de Ventas"]:
         conn = get_db_connection()
         df_ventas = pd.read_sql_query("""
             SELECT id, fecha AS "Fecha", serie AS "Serie", numero_factura AS "No. DTE",
-                   tercero_nombre AS "Cliente", subtotal AS "Base (Q)", iva AS "IVA (Q)",
+                   tercero_nombre AS "Cliente", tercero_nit AS "NIT", subtotal AS "Base (Q)", iva AS "IVA (Q)",
                    total AS "Total (Q)", total_a_pagar_cobrar AS "Líquido (Q)",
+                   cuenta_nomenclatura AS "Cuenta Ingreso", cuenta_pago AS "Cuenta Cobro",
                    forma_pago AS "Tipo Pago", estado_pago AS "Estado"
             FROM facturas 
             WHERE empresa_id = %s AND tipo = 'VENTA' 
@@ -855,10 +856,123 @@ elif selected_menu in ["📈 Factura de Ventas", "📈 Facturación de Ventas"]:
         if not df_ventas.empty:
             st.dataframe(df_ventas, use_container_width=True)
 
+            st.markdown("---")
+            st.subheader("✏️ Modificar / Corregir Factura de Venta")
+            
+            fac_edit_id = st.selectbox(
+                "Selecciona la factura de venta a editar:",
+                df_ventas['id'].tolist(),
+                format_func=lambda x: f"DTE: {df_ventas[df_ventas['id']==x]['No. DTE'].values[0]} - {df_ventas[df_ventas['id']==x]['Cliente'].values[0]} (Fecha: {df_ventas[df_ventas['id']==x]['Fecha'].values[0]} - Q{df_ventas[df_ventas['id']==x]['Total (Q)'].values[0]:,.2f})",
+                key="sel_fac_v_edit"
+            )
+
+            row_e = df_ventas[df_ventas['id'] == fac_edit_id].iloc[0]
+
+            with st.form("form_editar_factura_venta"):
+                ce1, ce2, ce3 = st.columns(3)
+                try:
+                    f_actual = datetime.strptime(str(row_e['Fecha']), "%Y-%m-%d").date()
+                except Exception:
+                    f_actual = date.today()
+                edit_fecha = ce1.date_input("Fecha Correcta de Emisión *", value=f_actual, key="edit_v_fec")
+                edit_num = ce2.text_input("Número Factura / No. DTE *", value=str(row_e['No. DTE']), key="edit_v_num")
+                edit_serie = ce3.text_input("Serie", value=str(row_e['Serie'] or ""), key="edit_v_ser")
+
+                ce4, ce5 = st.columns(2)
+                edit_cli = ce4.text_input("Cliente *", value=str(row_e['Cliente']), key="edit_v_cli")
+                edit_nit = ce5.text_input("NIT Cliente *", value=str(row_e['NIT']), key="edit_v_nit")
+
+                st.markdown("---")
+                ce6, ce7 = st.columns(2)
+                # Opciones de cuentas
+                idx_e_debe = 0
+                for i_d, it_d in enumerate(opciones_debe):
+                    if str(row_e['Cuenta Cobro']) in it_d:
+                        idx_e_debe = i_d; break
+                edit_cdebe = ce6.selectbox("Cuenta de Cobro / DEBE *", opciones_debe if opciones_debe else ["1.1.01.01 - Caja General (Efectivo)"], index=idx_e_debe, key="edit_v_cdebe")
+
+                idx_e_haber = 0
+                for i_h, it_h in enumerate(opciones_haber):
+                    if str(row_e['Cuenta Ingreso']) in it_h or "Transporte" in it_h:
+                        idx_e_haber = i_h; break
+                edit_chaber = ce7.selectbox("Cuenta de Ingreso / HABER *", opciones_haber if opciones_haber else ["4.1.01.03 - Servicios de Transporte y Fletes"], index=idx_e_haber, key="edit_v_chaber")
+
+                edit_tot = st.number_input("Monto Total Factura (Q) *", min_value=0.0, step=50.0, format="%.2f", value=float(row_e['Total (Q)']), key="edit_v_tot")
+                es_peq_actual = float(row_e['IVA (Q)']) == 0.0
+                edit_es_peq = st.checkbox("¿Régimen Pequeño Contribuyente? (Sin IVA)", value=es_peq_actual, key="edit_v_peq")
+
+                tot_mod = float(edit_tot)
+                if edit_es_peq:
+                    sub_mod = tot_mod
+                    iva_mod = 0.0
+                else:
+                    sub_mod = round(tot_mod / 1.12, 2)
+                    iva_mod = round(tot_mod - sub_mod, 2)
+
+                st.markdown(f"**Nuevo desglose:** Base: Q {sub_mod:,.2f} | IVA Débito: Q {iva_mod:,.2f} | Total: Q {tot_mod:,.2f}")
+
+                if st.form_submit_button("💾 Guardar Corrección de Factura de Venta", type="primary"):
+                    if not edit_num.strip() or not edit_cli.strip() or not edit_nit.strip() or tot_mod <= 0:
+                        st.error("Completa los campos obligatorios.")
+                    else:
+                        try:
+                            conn = get_db_connection()
+                            c = conn.cursor()
+                            # 1. Actualizar tabla facturas
+                            c.execute("""
+                                UPDATE facturas
+                                SET fecha = %s, numero_factura = %s, serie = %s,
+                                    tercero_nombre = %s, tercero_nit = %s,
+                                    subtotal = %s, iva = %s, total = %s, total_a_pagar_cobrar = %s,
+                                    cuenta_nomenclatura = %s, cuenta_pago = %s
+                                WHERE id = %s
+                            """, (
+                                str(edit_fecha), edit_num.strip(), edit_serie.strip(),
+                                edit_cli.strip(), edit_nit.strip().upper(),
+                                float(sub_mod), float(iva_mod), float(tot_mod), float(tot_mod),
+                                edit_chaber, edit_cdebe, fac_edit_id
+                            ))
+
+                            # 2. Reconstruir asiento en libro_diario
+                            # Borrar líneas viejas de esta factura
+                            antiguo_num = str(row_e['No. DTE'])
+                            c.execute("DELETE FROM libro_diario WHERE empresa_id = %s AND (referencia_id = %s OR concepto LIKE %s)",
+                                      (str(selected_emp_id), antiguo_num, f"%{antiguo_num}%"))
+
+                            # Asentar partida corregida
+                            c.execute("SELECT COALESCE(MAX(partida_no), 0) + 1 FROM libro_diario WHERE empresa_id = %s", (str(selected_emp_id),))
+                            p_no_corregida = int(c.fetchone()[0])
+                            glosa_mod = f"Factura Venta {edit_num} a {edit_cli}"
+                            now_mod = datetime.now().isoformat()
+
+                            cod_ed, nom_ed = edit_cdebe.split(" - ", 1) if " - " in edit_cdebe else (edit_cdebe, edit_cdebe)
+                            cod_eh, nom_eh = edit_chaber.split(" - ", 1) if " - " in edit_chaber else (edit_chaber, edit_chaber)
+
+                            q_ins_corregido = """
+                                INSERT INTO libro_diario (empresa_id, partida_no, fecha, codigo_cuenta, nombre_cuenta, debe, haber, concepto, referencia_id, created_at)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            """
+                            # Debe (Caja / Cobro)
+                            c.execute(q_ins_corregido, (str(selected_emp_id), p_no_corregida, str(edit_fecha), str(cod_ed), str(nom_ed), float(tot_mod), 0.0, glosa_mod, str(edit_num), now_mod))
+                            # Haber (Ingreso / Transporte)
+                            c.execute(q_ins_corregido, (str(selected_emp_id), p_no_corregida, str(edit_fecha), str(cod_eh), str(nom_eh), 0.0, float(sub_mod), glosa_mod, str(edit_num), now_mod))
+                            # IVA Débito si aplica
+                            if iva_mod > 0:
+                                c.execute(q_ins_corregido, (str(selected_emp_id), p_no_corregida, str(edit_fecha), '2.1.02.01', 'IVA por Pagar (Débito Fiscal)', 0.0, float(iva_mod), glosa_mod, str(edit_num), now_mod))
+
+                            conn.commit()
+                            conn.close()
+                            st.success("✅ Factura de venta y asiento contable actualizados con éxito.")
+                            st.rerun()
+                        except Exception as err:
+                            st.error(f"Error al guardar corrección: {err}")
+
             if is_admin:
+                st.markdown("---")
                 with st.expander("🗑️ Eliminar Factura (Solo Administrador)"):
                     fac_eliminar = st.selectbox("Selecciona factura a eliminar:", df_ventas['id'].tolist(),
-                                                format_func=lambda x: f"DTE: {df_ventas[df_ventas['id']==x]['No. DTE'].values[0]} - {df_ventas[df_ventas['id']==x]['Cliente'].values[0]}")
+                                                format_func=lambda x: f"DTE: {df_ventas[df_ventas['id']==x]['No. DTE'].values[0]} - {df_ventas[df_ventas['id']==x]['Cliente'].values[0]}",
+                                                key="sel_fac_v_del")
                     if st.button("Confirmar Eliminación Definitiva Venta", type="secondary"):
                         conn = get_db_connection()
                         c = conn.cursor()
@@ -896,7 +1010,15 @@ elif selected_menu == "🏠 Despensa Familiar (Cocina)":
         );
     """)
     conn.commit()
-    df_desp = pd.read_sql_query("SELECT id, nombre AS 'Artículo', categoria AS 'Categoría', unidad AS 'Unidad', stock_actual AS 'Existencia', stock_minimo AS 'Mínimo' FROM despensa_articulos ORDER BY categoria, nombre", conn)
+    df_desp = pd.read_sql_query("SELECT id, nombre, categoria, unidad, stock_actual, stock_minimo FROM despensa_articulos ORDER BY categoria, nombre", conn)
+    if not df_desp.empty:
+        df_desp = df_desp.rename(columns={
+            'nombre': 'Artículo',
+            'categoria': 'Categoría',
+            'unidad': 'Unidad',
+            'stock_actual': 'Existencia',
+            'stock_minimo': 'Mínimo'
+        })
     conn.close()
 
     t_desp1, t_desp2, t_desp3 = st.tabs(["📦 Inventario de Alimentos", "➕ Registrar Consumo", "🛒 Ingreso de Víveres"])
@@ -960,7 +1082,16 @@ elif selected_menu == "🏠 Despensa Familiar (Cocina)":
 elif selected_menu == "👥 Directorio Terceros (Clientes/Proveedores)":
     st.title("👥 Directorio Corporativo de Clientes y Proveedores")
     conn = get_db_connection()
-    df_terc = pd.read_sql_query("SELECT nit AS 'NIT', nombre AS 'Nombre / Razón Social', tipo AS 'Tipo', direccion AS 'Dirección', telefono AS 'Teléfono', email AS 'Correo' FROM terceros_corporativos ORDER BY nombre", conn)
+    df_terc = pd.read_sql_query("SELECT nit, nombre, tipo, direccion, telefono, email FROM terceros_corporativos ORDER BY nombre", conn)
+    if not df_terc.empty:
+        df_terc = df_terc.rename(columns={
+            'nit': 'NIT',
+            'nombre': 'Nombre / Razón Social',
+            'tipo': 'Tipo',
+            'direccion': 'Dirección',
+            'telefono': 'Teléfono',
+            'email': 'Correo'
+        })
     conn.close()
     if not df_terc.empty:
         st.dataframe(df_terc, use_container_width=True)
@@ -1639,7 +1770,13 @@ elif selected_menu == "🗂️ Nomenclatura Contable":
     if not selected_emp_id: st.stop()
     st.title(f"🗂️ Nomenclatura Contable — {selected_empresa_info[1]}")
     conn = get_db_connection()
-    df_nom = pd.read_sql_query("SELECT codigo AS 'Código', nombre AS 'Nombre de Cuenta', tipo AS 'Tipo' FROM nomenclatura WHERE empresa_id = %s ORDER BY codigo", conn, params=(str(selected_emp_id),))
+    df_nom = pd.read_sql_query("SELECT codigo, nombre, tipo FROM nomenclatura WHERE empresa_id = %s ORDER BY codigo", conn, params=(str(selected_emp_id),))
+    if not df_nom.empty:
+        df_nom = df_nom.rename(columns={
+            'codigo': 'Código',
+            'nombre': 'Nombre de Cuenta',
+            'tipo': 'Tipo'
+        })
     conn.close()
 
     if not df_nom.empty:
@@ -1666,7 +1803,16 @@ elif selected_menu == "👤 Control de Usuarios (Admin)":
     if not is_admin: st.error("Acceso restringido."); st.stop()
     st.title("👤 Control de Usuarios del Sistema")
     conn = get_db_connection()
-    df_users = pd.read_sql_query("SELECT id, username AS 'Usuario', name AS 'Nombre', email AS 'Correo', role AS 'Rol', status AS 'Estado', assigned_empresas AS 'Empresas Asignadas' FROM users ORDER BY name", conn)
+    df_users = pd.read_sql_query("SELECT id, username, name, email, role, status, assigned_empresas FROM users ORDER BY name", conn)
+    if not df_users.empty:
+        df_users = df_users.rename(columns={
+            'username': 'Usuario',
+            'name': 'Nombre',
+            'email': 'Correo',
+            'role': 'Rol',
+            'status': 'Estado',
+            'assigned_empresas': 'Empresas Asignadas'
+        })
     conn.close()
     st.dataframe(df_users, use_container_width=True)
 
@@ -1677,7 +1823,13 @@ elif selected_menu == "🏢 Gestión de Empresas (Admin)":
     if not is_admin: st.error("Acceso restringido."); st.stop()
     st.title("🏢 Gestión de Empresas")
     conn = get_db_connection()
-    df_e = pd.read_sql_query("SELECT id, nombre AS 'Razón Social', nit AS 'NIT', regimen_isr AS 'Régimen ISR' FROM empresas ORDER BY nombre", conn)
+    df_e = pd.read_sql_query("SELECT id, nombre, nit, regimen_isr FROM empresas ORDER BY nombre", conn)
+    if not df_e.empty:
+        df_e = df_e.rename(columns={
+            'nombre': 'Razón Social',
+            'nit': 'NIT',
+            'regimen_isr': 'Régimen ISR'
+        })
     conn.close()
 
     if not df_e.empty:
