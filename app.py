@@ -642,7 +642,7 @@ elif selected_menu == "📈 Factura de Ventas":
             if iva_v > 0: partida_v.append({"Cuenta": "2.1.02.01 - IVA por Pagar", "DEBE": "Q 0.00", "HABER": f"Q {iva_v:,.2f}"})
             st.table(pd.DataFrame(partida_v))
 
-            elif selected_menu in ["📈 Factura de Ventas", "📈 Facturación de Ventas"]:
+elif selected_menu in ["📈 Factura de Ventas", "📈 Facturación de Ventas"]:
     if not selected_emp_id:
         st.warning("Selecciona una empresa primero.")
         st.stop()
@@ -677,7 +677,6 @@ elif selected_menu == "📈 Factura de Ventas":
             col_cta1, col_cta2 = st.columns(2)
             v_cta_debe = col_cta1.selectbox("Cuenta de Cobro / DEBE (Caja / Banco / Cliente) *", opciones_debe if opciones_debe else ["1.1.01.01 - Caja General (Efectivo)"], key="v_cdebe_sel")
             
-            # Buscar por defecto la cuenta de transporte o ventas
             idx_hab = next((i for i, x in enumerate(opciones_haber) if "4.1.01.03" in x or "Transporte" in x), 0)
             v_cta_haber = col_cta2.selectbox("Cuenta de Ingreso / HABER *", opciones_haber if opciones_haber else ["4.1.01.03 - Servicios de Transporte y Fletes"], index=idx_hab, key="v_chaber_sel")
             
@@ -692,7 +691,6 @@ elif selected_menu == "📈 Factura de Ventas":
             ret_iva_chk = col_ret2.checkbox("Cliente practicó Retención de IVA", value=False, key="v_riva_chk")
             tasa_iva_sel = col_ret2.selectbox("Tasa IVA Retenida", ["No Aplica / No es Agente Retenedor", "15% Retención IVA", "100% Retención Total IVA"], key="v_tiva_sel")
             
-            # Cálculos automáticos seguros
             monto_base = float(v_subtotal)
             monto_iva = 0.0 if es_pequeno else round(monto_base * 0.12, 2)
             monto_total = monto_base if es_pequeno else round(monto_base + monto_iva, 2)
@@ -707,9 +705,8 @@ elif selected_menu == "📈 Factura de Ventas":
                 
             liquido = round(monto_total - m_isr - m_iva, 2)
             
-            st.markdown(f"**Base Imponible:** Q {monto_base:,.2f} | **IVA Débito:** Q {monto_iva:,.2f} | **Líquido a Recibir:** Q {liquido:,.2f}")
+            st.markdown(f"**Base Imponible:** Q {monto_base:,.2f} | **IVA Débito Fiscal:** Q {monto_iva:,.2f} | **Líquido a Recibir:** Q {liquido:,.2f}")
             
-            # Previsualización de Partida
             prev_rows = [
                 {"Cuenta": v_cta_debe, "DEBE": f"Q {liquido:,.2f}", "HABER": "Q 0.00"},
                 {"Cuenta": v_cta_haber, "DEBE": "Q 0.00", "HABER": f"Q {monto_base:,.2f}"}
@@ -734,7 +731,6 @@ elif selected_menu == "📈 Factura de Ventas":
                         now_str = datetime.now().isoformat()
                         fac_id = f"fac-v-{int(datetime.now().timestamp())}"
                         
-                        # 1. Inserción en facturas
                         c.execute("""
                             INSERT INTO facturas (
                                 id, empresa_id, tipo, numero_factura, serie, fecha,
@@ -754,7 +750,6 @@ elif selected_menu == "📈 Factura de Ventas":
                             str(v_cta_haber), str(v_cta_debe)
                         ))
                         
-                        # 2. Partida en libro_diario
                         c.execute("SELECT COALESCE(MAX(partida_no), 0) + 1 FROM libro_diario WHERE empresa_id = %s", (str(selected_emp_id),))
                         p_no = int(c.fetchone()[0])
                         glosa = f"Factura Venta {v_num} a {v_cli_nom}"
@@ -766,14 +761,12 @@ elif selected_menu == "📈 Factura de Ventas":
                             INSERT INTO libro_diario (empresa_id, partida_no, fecha, codigo_cuenta, nombre_cuenta, debe, haber, concepto, referencia_id, created_at)
                             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """
-                        # Debe (Caja / Cobro)
                         c.execute(q_diario, (str(selected_emp_id), p_no, str(v_fecha), str(cod_d), str(nom_d), float(liquido), 0.0, glosa, str(v_num), str(now_str)))
                         if m_isr > 0:
                             c.execute(q_diario, (str(selected_emp_id), p_no, str(v_fecha), '1.1.03.02', 'ISR Retenido por Acreditar', float(m_isr), 0.0, glosa, str(v_num), str(now_str)))
                         if m_iva > 0:
                             c.execute(q_diario, (str(selected_emp_id), p_no, str(v_fecha), '1.1.03.03', 'Constancias Retención IVA', float(m_iva), 0.0, glosa, str(v_num), str(now_str)))
                             
-                        # Haber (Ingreso / Transporte)
                         c.execute(q_diario, (str(selected_emp_id), p_no, str(v_fecha), str(cod_h), str(nom_h), 0.0, float(monto_base), glosa, str(v_num), str(now_str)))
                         if monto_iva > 0:
                             c.execute(q_diario, (str(selected_emp_id), p_no, str(v_fecha), '2.1.02.01', 'IVA por Pagar (Débito Fiscal)', 0.0, float(monto_iva), glosa, str(v_num), str(now_str)))
@@ -799,7 +792,6 @@ elif selected_menu == "📈 Factura de Ventas":
             st.dataframe(df_ventas, use_container_width=True)
         else:
             st.info("No hay facturas de ventas para editar.")
-
 # ==========================================
 # 3. FACTURA DE COMPRAS
 # ==========================================
