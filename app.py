@@ -1208,13 +1208,12 @@ elif selected_menu == "💰 Cuentas por Cobrar (Clientes)":
                     st.success("Cobro registrado y saldos actualizados."); st.rerun()
 
 # ==========================================
-# 8. KÁRDEX / INVENTARIOS (CORPORATIVO UNIVERSAL)
+# 8. KÁRDEX / INVENTARIOS (CORPORATIVO CON EDICIÓN)
 # ==========================================
 elif selected_menu == "📦 Control de Inventarios (Kárdex)":
     st.title("📦 Catálogo e Inventario de Productos (Kárdex)")
     conn = get_db_connection()
     c = conn.cursor()
-    # Garantizar que las columnas existan sin conflicto de tipos
     c.execute("""
         CREATE TABLE IF NOT EXISTS productos (
             id TEXT PRIMARY KEY,
@@ -1229,18 +1228,15 @@ elif selected_menu == "📦 Control de Inventarios (Kárdex)":
     """)
     conn.commit()
 
-    # Detectar columnas reales de la tabla productos en Supabase
     c.execute("SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'productos'")
     info_cols = c.fetchall()
     nombres_cols = [r[0].lower() for r in info_cols]
     dict_tipos = {r[0].lower(): r[1].lower() for r in info_cols}
 
-    # Leer productos existentes de forma limpia
     df_prod = pd.read_sql_query("SELECT * FROM productos ORDER BY codigo ASC", conn)
     conn.close()
 
     if not df_prod.empty:
-        # Renombrar columnas para la vista corporativa
         cols_mostrar = {}
         if 'codigo' in df_prod.columns: cols_mostrar['codigo'] = 'Código'
         if 'descripcion' in df_prod.columns: cols_mostrar['descripcion'] = 'Descripción'
@@ -1254,25 +1250,27 @@ elif selected_menu == "📦 Control de Inventarios (Kárdex)":
     else:
         st.info("No hay productos registrados en el catálogo.")
 
-    # Calcular siguiente código correlativo automático
-    prox_cod = "1"
-    if not df_prod.empty and 'codigo' in df_prod.columns:
-        try:
-            numeros = [int(re.sub(r'\D', '', str(x))) for x in df_prod['codigo'] if re.sub(r'\D', '', str(x))]
-            if numeros:
-                prox_cod = str(max(numeros) + 1)
-        except Exception:
-            prox_cod = str(len(df_prod) + 1)
+    # Pestañas o secciones para Crear y Modificar
+    t_crear_p, t_editar_p = st.tabs(["➕ Crear Nuevo Producto", "✏️ Modificar / Editar Producto"])
 
-    with st.expander("➕ Crear Nuevo Producto en Catálogo"):
+    with t_crear_p:
+        prox_cod = "1"
+        if not df_prod.empty and 'codigo' in df_prod.columns:
+            try:
+                numeros = [int(re.sub(r'\D', '', str(x))) for x in df_prod['codigo'] if re.sub(r'\D', '', str(x))]
+                if numeros:
+                    prox_cod = str(max(numeros) + 1)
+            except Exception:
+                prox_cod = str(len(df_prod) + 1)
+
         with st.form("form_prod_corporativo"):
             c1, c2 = st.columns(2)
-            pcod = c1.text_input("Código de Artículo (Secuencia 1 - 1,000,000) *", value=prox_cod)
-            pdesc = c2.text_input("Descripción del Producto *", placeholder="Ej. Transporte de mercadería / Producto X")
+            pcod = c1.text_input("Código de Artículo (Secuencia 1 - 1,000,000) *", value=prox_cod, key="p_new_cod")
+            pdesc = c2.text_input("Descripción del Producto *", placeholder="Ej. Cascarilla de arroz / Betaina al 96%", key="p_new_desc")
             c3, c4, c5 = st.columns(3)
-            pexi = c3.number_input("Existencia Inicial:", min_value=0.0, step=1.0, value=0.0)
-            pcost = c4.number_input("Costo Unitario Referencial (Q):", min_value=0.0, step=10.0, value=0.0)
-            pprec = c5.number_input("Precio Venta Sugerido (Q):", min_value=0.0, step=10.0, value=0.0)
+            pexi = c3.number_input("Existencia Inicial:", min_value=0.0, step=1.0, value=0.0, key="p_new_exi")
+            pcost = c4.number_input("Costo Unitario Referencial (Q):", min_value=0.0, step=10.0, value=0.0, key="p_new_cost")
+            pprec = c5.number_input("Precio Venta Sugerido (Q):", min_value=0.0, step=10.0, value=0.0, key="p_new_prec")
 
             if st.form_submit_button("Guardar Producto en Catálogo", type="primary"):
                 if pcod.strip() and pdesc.strip():
@@ -1282,34 +1280,28 @@ elif selected_menu == "📦 Control de Inventarios (Kárdex)":
                         now_str = datetime.now().isoformat()
                         ts_num = int(datetime.now().timestamp())
                         
-                        # Armar inserción dinámica según la estructura real de la tabla
                         campos = []
                         valores = []
                         placeholders = []
 
-                        # Columna 'id'
                         if 'id' in nombres_cols:
                             campos.append("id")
                             placeholders.append("%s")
                             t_id = dict_tipos.get('id', '')
                             if "int" in t_id or "serial" in t_id:
-                                # Si id es entero
                                 valores.append(ts_num % 2147483647)
                             else:
                                 valores.append(f"prod-{ts_num}")
 
-                        # Columna 'empresa_id' si existe en la tabla
                         if 'empresa_id' in nombres_cols:
                             campos.append("empresa_id")
                             placeholders.append("%s")
                             valores.append(str(selected_emp_id) if selected_emp_id else "global")
 
-                        # Columnas principales
                         campos.extend(["codigo", "descripcion", "existencia", "costo_promedio", "precio_venta"])
                         placeholders.extend(["%s", "%s", "%s", "%s", "%s"])
                         valores.extend([pcod.strip(), pdesc.strip(), float(pexi), float(pcost), float(pprec)])
 
-                        # Columna 'created_at' si existe
                         if 'created_at' in nombres_cols:
                             campos.append("created_at")
                             placeholders.append("%s")
@@ -1326,6 +1318,61 @@ elif selected_menu == "📦 Control de Inventarios (Kárdex)":
                 else:
                     st.error("Código y Descripción son obligatorios.")
 
+    with t_editar_p:
+        if not df_prod.empty:
+            dict_prods_edit = {f"Código {r['codigo']} — {r['descripcion']} (Existencia: {r.get('existencia', 0)})": r['id'] for _, r in df_prod.iterrows()}
+            prod_sel_label = st.selectbox("Selecciona el producto a corregir o modificar:", list(dict_prods_edit.keys()), key="prod_sel_edit_box")
+            prod_id_edit = dict_prods_edit[prod_sel_label]
+            row_prod = df_prod[df_prod['id'] == prod_id_edit].iloc[0]
+
+            with st.form("form_editar_producto_kardex"):
+                st.subheader(f"Modificar datos del Producto")
+                ce1, ce2 = st.columns(2)
+                edit_pcod = ce1.text_input("Código de Artículo *", value=str(row_prod['codigo']), key="edit_prod_cod")
+                edit_pdesc = ce2.text_input("Descripción del Producto *", value=str(row_prod['descripcion']), key="edit_prod_desc")
+
+                ce3, ce4, ce5 = st.columns(3)
+                edit_pexi = ce3.number_input("Existencia:", min_value=0.0, step=0.01, format="%.2f", value=float(row_prod.get('existencia', 0.0) or 0.0), key="edit_prod_exi")
+                edit_pcost = ce4.number_input("Costo Promedio (Q):", min_value=0.0, step=10.0, format="%.2f", value=float(row_prod.get('costo_promedio', 0.0) or 0.0), key="edit_prod_cost")
+                edit_pprec = ce5.number_input("Precio Venta Ref. (Q):", min_value=0.0, step=10.0, format="%.2f", value=float(row_prod.get('precio_venta', 0.0) or 0.0), key="edit_prod_prec")
+
+                b_guardar_pe, b_eliminar_pe = st.columns([2, 1])
+                btn_save_pe = b_guardar_pe.form_submit_button("💾 Guardar Corrección del Producto", type="primary")
+
+                if btn_save_pe:
+                    if edit_pcod.strip() and edit_pdesc.strip():
+                        try:
+                            conn = get_db_connection()
+                            c = conn.cursor()
+                            c.execute("""
+                                UPDATE productos
+                                SET codigo = %s, descripcion = %s, existencia = %s, costo_promedio = %s, precio_venta = %s
+                                WHERE id = %s
+                            """, (edit_pcod.strip(), edit_pdesc.strip(), float(edit_pexi), float(edit_pcost), float(edit_pprec), prod_id_edit))
+                            conn.commit()
+                            conn.close()
+                            st.success(f"✅ Producto '{edit_pdesc.strip()}' actualizado exitosamente.")
+                            st.rerun()
+                        except Exception as err:
+                            st.error(f"❌ Error al actualizar producto: {err}")
+                    else:
+                        st.error("Código y Descripción no pueden quedar vacíos.")
+
+            if is_admin:
+                with st.expander("🗑️ Eliminar Producto del Catálogo (Solo Administrador)"):
+                    if st.button(f"Confirmar Eliminación Definitiva de '{row_prod['descripcion']}'", type="secondary", key="btn_del_prod"):
+                        try:
+                            conn = get_db_connection()
+                            c = conn.cursor()
+                            c.execute("DELETE FROM productos WHERE id = %s", (prod_id_edit,))
+                            conn.commit()
+                            conn.close()
+                            st.warning(f"Producto '{row_prod['descripcion']}' eliminado.")
+                            st.rerun()
+                        except Exception as err:
+                            st.error(f"Error al eliminar: {err}")
+        else:
+            st.info("No hay productos disponibles para editar.")
 # ==========================================
 # 9. LIBRO DE COMPRAS (SAT)
 # ==========================================
