@@ -404,85 +404,172 @@ if selected_menu == "📊 Resumen General":
 # ==========================================
 # 2. FACTURA DE COMPRAS
 # ==========================================
-elif selected_menu in ["👥 Directorio de Terceros", "🏢 Directorio Corporativo (Clientes/Proveedores)"]:
-    st.title("👥 Directorio Corporativo de Clientes y Proveedores")
-    st.caption("Los terceros registrados aquí están disponibles globalmente para todas tus empresas.")
+elif selected_menu in ["🛒 Factura de Compras", "🛒 Compras y Gastos"]:
+    if not selected_emp_id:
+        st.warning("Selecciona una empresa primero.")
+        st.stop()
+        
+    st.title("🛒 Facturas de Compras, Gastos e Inventario")
+    st.caption(f"Empresa activa: {selected_empresa_info[1]}")
 
-    tab_nuevo, tab_editar = st.tabs(["➕ Registrar Tercero", "✏️ Consultar y Editar Terceros"])
+    conn = get_db_connection()
+    cuentas_gasto = pd.read_sql_query("SELECT codigo, nombre FROM nomenclatura WHERE empresa_id = %s AND (tipo = 'Gasto' OR tipo = 'Activo') ORDER BY codigo", conn, params=(selected_emp_id,))
+    cuentas_pasivo_pago = pd.read_sql_query("SELECT codigo, nombre FROM nomenclatura WHERE empresa_id = %s AND (tipo = 'Pasivo' OR tipo = 'Activo') ORDER BY codigo", conn, params=(selected_emp_id,))
+    # Catálogo de inventario corporativo
+    productos_bd = pd.read_sql_query("SELECT id, codigo, descripcion, existencia, costo_promedio FROM productos ORDER BY codigo ASC", conn)
+    prov_corp = pd.read_sql_query("SELECT nit, nombre FROM terceros_corp WHERE tipo IN ('PROVEEDOR', 'AMBOS') ORDER BY nombre", conn)
+    conn.close()
 
-    with tab_nuevo:
-        with st.form("form_tercero_corp", clear_on_submit=True):
-            col1, col2, col3 = st.columns(3)
-            t_tipo = col1.selectbox("Clasificación:", ["PROVEEDOR", "CLIENTE", "AMBOS"])
-            t_nit = col2.text_input("NIT (Sin guiones) *").strip().upper()
-            t_nom = col3.text_input("Nombre o Razón Social *").strip()
-            col4, col5 = st.columns(2)
-            t_dir = col4.text_input("Dirección Fiscal")
-            t_tel = col5.text_input("Teléfono")
+    opciones_debe = [f"{r['codigo']} - {r['nombre']}" for _, r in cuentas_gasto.iterrows()]
+    opciones_haber = [f"{r['codigo']} - {r['nombre']}" for _, r in cuentas_pasivo_pago.iterrows()]
 
-            if st.form_submit_button("Guardar en Directorio", type="primary"):
-                if t_nit and t_nom:
-                    conn = get_db_connection()
-                    c = conn.cursor()
-                    try:
-                        c.execute('''
-                            INSERT INTO terceros_corp (id, tipo, nit, nombre, direccion, telefono, created_at)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s)
-                        ''', (f"terc-{int(datetime.now().timestamp())}", t_tipo, t_nit, t_nom, t_dir, t_tel, datetime.now().isoformat()))
-                        conn.commit()
-                        st.success(f"✅ Tercero '{t_nom}' registrado corporativamente.")
-                        st.rerun()
-                    except psycopg2.IntegrityError:
-                        st.error("Ya existe un tercero registrado con este NIT.")
-                    finally:
-                        conn.close()
-                else:
-                    st.error("El NIT y el Nombre son obligatorios.")
+    # Selector de modalidad: Documento Fiscal (PDF/Manual) o No Fiscal (Vales/Recibos)
+    tipo_doc = st.radio("Tipo de Documento:", ["📄 Factura DTE / Fiscal SAT", "🧾 Documento No Fiscal (Vale / Recibo)"], horizontal=True, key="c_tipodoc")
+    
+    pre_datos = {}
+    if tipo_doc == "📄 Factura DTE / Fiscal SAT":
+        modo_ingreso = st.radio("Método de Ingreso:", ["📄 Carga desde PDF (FEL SAT)", "✍️ Ingreso Manual"], horizontal=True, key="c_modoing")
+        if modo_ingreso == "📄 Carga desde PDF (FEL SAT)":
+            dte_cargado = st.file_uploader("Sube el PDF emitido por SAT (FEL)", type=["pdf"], key="pdf_compra_fel")
+            if dte_cargado:
+                try:
+                    pre_datos = extraer_datos_dte_sat(dte_cargado)
+                    st.success("✅ Factura FEL procesada con éxito.")
+                except Exception:
+                    st.warning("No se pudieron extraer automáticamente todos los datos del archivo.")
 
-    with tab_editar:
-        conn = get_db_connection()
-        df_terc = pd.read_sql_query("SELECT id, tipo, nit, nombre, direccion, telefono FROM terceros_corp ORDER BY nombre ASC", conn)
-        conn.close()
+    with st.expander("➕ Formulario de Registro de Compra / Gasto", expanded=True):
+        c1, c2, c3 = st.columns(3)
+        num_fac = c1.text_input("Número Factura / Documento *", value=pre_datos.get("numero_dte", ""), key="fc_num")
+        serie = c2.text_input("Serie", value=pre_datos.get("serie", ""), key="fc_ser")
+        fecha_fac = c3.date_input("Fecha de Emisión", value=pre_datos.get("fecha") or date.today(), key="fc_fec")
 
-        if not df_terc.empty:
-            dict_edit = {f"{r['nombre']} (NIT: {r['nit']})": r['id'] for _, r in df_terc.iterrows()}
-            sel_terc_label = st.selectbox("Selecciona un tercero para editar:", list(dict_edit.keys()))
-            terc_id_sel = dict_edit[sel_terc_label]
-            datos_sel = df_terc[df_terc['id'] == terc_id_sel].iloc[0]
+        c4, c5 = st.columns(2)
+        dict_provs = {f"{r['nombre']} (NIT: {r['nit']})": (r['nombre'], r['nit']) for _, r in prov_corp.iterrows()}
+        prov_seleccionado = c4.selectbox("Buscar Proveedor en Directorio Corporativo (Opcional):", ["-- Ingresar Manual / Desde PDF --"] + list(dict_provs.keys()), key="fc_sel_prov")
 
-            with st.form("form_edit_terc"):
-                st.markdown(f"#### Editando datos de: **{datos_sel['nombre']}**")
-                e_col1, e_col2, e_col3 = st.columns(3)
-                e_tipo = e_col1.selectbox("Clasificación:", ["PROVEEDOR", "CLIENTE", "AMBOS"], index=["PROVEEDOR", "CLIENTE", "AMBOS"].index(datos_sel['tipo']))
-                e_nit = e_col2.text_input("NIT (Sin guiones) *", value=datos_sel['nit']).strip().upper()
-                e_nom = e_col3.text_input("Nombre o Razón Social *", value=datos_sel['nombre']).strip()
-                
-                e_col4, e_col5 = st.columns(2)
-                e_dir = e_col4.text_input("Dirección Fiscal", value=datos_sel['direccion'] or "")
-                e_tel = e_col5.text_input("Teléfono", value=datos_sel['telefono'] or "")
-
-                if st.form_submit_button("💾 Guardar Cambios", type="primary"):
-                    if e_nit and e_nom:
-                        conn = get_db_connection()
-                        c = conn.cursor()
-                        c.execute('''
-                            UPDATE terceros_corp 
-                            SET tipo = %s, nit = %s, nombre = %s, direccion = %s, telefono = %s 
-                            WHERE id = %s
-                        ''', (e_tipo, e_nit, e_nom, e_dir, e_tel, terc_id_sel))
-                        conn.commit()
-                        conn.close()
-                        st.success(f"Datos de '{e_nom}' actualizados correctamente.")
-                        st.rerun()
-                    else:
-                        st.error("El NIT y el Nombre son obligatorios.")
-
-            st.markdown("---")
-            st.markdown("### Directorio Completo")
-            st.dataframe(df_terc[['tipo', 'nit', 'nombre', 'direccion', 'telefono']], use_container_width=True)
+        if prov_seleccionado != "-- Ingresar Manual / Desde PDF --":
+            val_nom, val_nit = dict_provs[prov_seleccionado]
         else:
-            st.info("No hay terceros registrados aún.")
+            val_nom = pre_datos.get("emisor_nombre", "")
+            val_nit = pre_datos.get("emisor_nit", "")
 
+        prov_nombre = c4.text_input("Nombre o Razón Social del Proveedor *", value=val_nom, key="fc_prv")
+        prov_nit = c5.text_input("NIT del Proveedor *", value=val_nit, key="fc_nit")
+
+        # SELECTOR OBLIGATORIO: BIEN O SERVICIO
+        st.markdown("---")
+        tipo_adquisicion = st.radio("Tipo de Adquisición Contable:", ["🛍️ Bien (Mercadería / Activo Fijo)", "🛠️ Servicio"], horizontal=True, key="fc_tipoadq")
+
+        prod_sel_id = None
+        cant_unidades = 0
+        es_inventario = False
+
+        if tipo_adquisicion == "🛍️ Bien (Mercadería / Activo Fijo)":
+            c_bien1, c_bien2 = st.columns(2)
+            destino_bien = c_bien1.selectbox("Destino del Bien:", ["Mercadería para Inventario (Kárdex)", "Activo Fijo / Uso Operativo"], key="fc_dest_bien")
+            
+            if destino_bien == "Mercadería para Inventario (Kárdex)":
+                es_inventario = True
+                dict_prods = {f"[{r['codigo']}] {r['descripcion']} (Stock: {r['existencia']})": r['id'] for _, r in productos_bd.iterrows()}
+                opciones_k = ["-- Seleccionar Producto del Catálogo --"] + list(dict_prods.keys())
+                sel_p = c_bien2.selectbox("Producto a Ingresar en Kárdex:", opciones_k, key="fc_prod_k")
+                
+                col_u1, col_u2 = st.columns(2)
+                cant_unidades = col_u1.number_input("Cantidad de Unidades a Ingresar *", min_value=1, step=1, value=1, key="fc_cant_inv")
+                
+                if sel_p != "-- Seleccionar Producto del Catálogo --":
+                    prod_sel_id = dict_prods[sel_p]
+                else:
+                    st.info("💡 Si el producto aún no existe, regístralo previamente en el módulo Control de Inventarios (Kárdex).")
+
+        col_fp1, col_fp2 = st.columns(2)
+        tipo_pago = col_fp1.selectbox("Condición de Pago:", ["Contado", "Crédito"], key="fc_tpago")
+        if tipo_pago == "Contado":
+            metodo_det = col_fp2.selectbox("Método de Pago:", ["Efectivo", "Transferencia / Cheque", "Tarjeta de Crédito / Débito"], key="fc_met")
+            idx_h = next((i for i, c in enumerate(opciones_haber) if ("1.1.01.01" if metodo_det == "Efectivo" else "1.1.01.02") in c), 0)
+        else:
+            col_fp2.info("Se asentará a Cuentas por Pagar (Proveedores).")
+            idx_h = next((i for i, c in enumerate(opciones_haber) if "2.1.01.01" in c), 0)
+
+        c6, c7 = st.columns(2)
+        # Cuenta sugerida por defecto
+        idx_def_debe = next((i for i, c in enumerate(opciones_debe) if "1.1.04.01" in c), 0) if es_inventario else next((i for i, c in enumerate(opciones_debe) if "5.1.01.01" in c), 0)
+        cuenta_debe = c6.selectbox("Cuenta de Cargo / DEBE *", opciones_debe if opciones_debe else ["5.1.01.01 - Compras de Mercadería"], index=idx_def_debe, key="fc_cdebe")
+        cuenta_haber = c7.selectbox("Cuenta de Abono / HABER *", opciones_haber if opciones_haber else ["2.1.01.01 - Proveedores / Cuentas por Pagar"], index=idx_h, key="fc_chaber")
+
+        # Ingreso del Total Facturado
+        total_ingresado = st.number_input("Total Facturado Q *", min_value=0.0, step=50.0, format="%.2f", value=float(pre_datos.get("total", 0.0)), key="fc_tot")
+
+        if tipo_doc == "🧾 Documento No Fiscal (Vale / Recibo)":
+            subtotal = total_ingresado
+            iva = 0.0
+            t_isr, m_isr, t_iva, m_iva, liq = "No Aplica", 0.0, "No Aplica", 0.0, total_ingresado
+            st.info(f"Comprobante No Fiscal: Monto Q{total_ingresado:,.2f} (Sin Crédito Fiscal IVA).")
+        else:
+            subtotal = round(total_ingresado / 1.12, 2)
+            iva = round(total_ingresado - subtotal, 2)
+            
+            r1, r2 = st.columns(2)
+            aplica_isr = r1.checkbox("Practicar Retención ISR", value=(subtotal >= 2800.0), key="fc_chkisr")
+            tipo_isr = r1.selectbox("Tasa ISR", ["5% General", "7% Excedente (Sobre Q30k)", "10% Servicios Técnicos/Honorarios", "No Aplica"], index=0 if subtotal >= 2800.0 else 3, key="fc_tisr")
+
+            aplica_iva = r2.checkbox("Practicar Retención IVA", value=False, key="fc_chkiva")
+            tipo_iva = r2.selectbox("Tasa IVA", ["No Aplica / No es Agente Retenedor", "15% Retención IVA (Decreto 20-2006)", "25% Exportadores", "100% Retención Total IVA"], key="fc_tiva")
+
+            iva_calc, tot_calc, t_isr, m_isr, t_iva, m_iva, liq = calcular_retenciones(subtotal, aplica_isr, tipo_isr, aplica_iva, tipo_iva)
+            st.info(f"Subtotal: Q{subtotal:,.2f} | IVA: Q{iva:,.2f} | **Total:** Q{total_ingresado:,.2f} | Ret. ISR: Q{m_isr:,.2f} | Ret. IVA: Q{m_iva:,.2f} | **Líquido a Pagar:** Q{liq:,.2f}")
+
+        if st.button("Guardar Factura y Asentar en Diario", type="primary", key="btn_save_c"):
+            if num_fac and prov_nombre and prov_nit and total_ingresado > 0:
+                conn = get_db_connection()
+                c = conn.cursor()
+                fac_id = f"fac-c-{int(datetime.now().timestamp())}"
+                fp_desc = f"{tipo_pago}" if tipo_pago == "Crédito" else f"Contado ({metodo_det})"
+
+                # 1. Guardar en directorio de terceros si no existe
+                try:
+                    c.execute('''
+                        INSERT INTO terceros_corp (id, tipo, nit, nombre, direccion, telefono, created_at)
+                        VALUES (%s, 'PROVEEDOR', %s, %s, 'Guatemala', '', %s)
+                        ON CONFLICT (nit) DO UPDATE SET nombre = EXCLUDED.nombre
+                    ''', (f"terc-{int(datetime.now().timestamp())}", prov_nit.strip().upper(), prov_nombre.strip(), datetime.now().isoformat()))
+                except Exception:
+                    pass
+
+                # 2. Inserción de la factura
+                c.execute('''
+                    INSERT INTO facturas (id, empresa_id, tipo, numero_factura, serie, fecha, tercero_nombre, tercero_nit, descripcion, tipo_gasto_ingreso, cuenta_nomenclatura, cuenta_pago, forma_pago, subtotal, iva, total, aplica_ret_isr, tasa_ret_isr, monto_ret_isr, aplica_ret_iva, tasa_ret_iva, monto_ret_iva, total_a_pagar_cobrar, created_by, created_at)
+                    VALUES (%s, %s, 'COMPRA', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ''', (fac_id, selected_emp_id, num_fac, serie, str(fecha_fac), prov_nombre, prov_nit, tipo_adquisicion, tipo_adquisicion, cuenta_debe, cuenta_haber, fp_desc, subtotal, iva, total_ingresado,
+                      1 if (tipo_isr != "No Aplica") else 0, t_isr, m_isr,
+                      1 if (tipo_iva != "No Aplica / No es Agente Retenedor") else 0, t_iva, m_iva, liq, curr_u['username'], datetime.now().isoformat()))
+
+                # 3. Entrada en inventario
+                if es_inventario and prod_sel_id and cant_unidades > 0:
+                    c.execute("SELECT existencia, costo_promedio FROM productos WHERE id = %s", (prod_sel_id,))
+                    p_row = c.fetchone()
+                    if p_row:
+                        stock_actual = float(p_row[0] or 0)
+                        costo_actual = float(p_row[1] or 0)
+                        costo_compra_unit = subtotal / cant_unidades
+                        nuevo_stock = stock_actual + cant_unidades
+                        nuevo_costo_prom = round(((stock_actual * costo_actual) + subtotal) / nuevo_stock, 2) if nuevo_stock > 0 else costo_compra_unit
+
+                        c.execute("UPDATE productos SET existencia = %s, costo_promedio = %s WHERE id = %s",
+                                  (nuevo_stock, nuevo_costo_prom, prod_sel_id))
+
+                conn.commit()
+                conn.close()
+
+                # Asiento contable
+                cod_d, nom_d = cuenta_debe.split(" - ", 1)
+                cod_h, nom_h = cuenta_haber.split(" - ", 1)
+                registrar_partida_compra(selected_emp_id, fecha_fac, cod_d, nom_d, cod_h, nom_h, subtotal, iva, m_isr, m_iva, liq, num_fac, prov_nombre)
+                st.success("✅ Factura registrada con éxito y Kárdex actualizado.")
+                st.rerun()
+            else:
+                st.error("Completa todos los campos obligatorios y asegúrate de que el total sea mayor a 0.")
 # ==========================================
 # 3. FACTURA DE VENTAS
 # ==========================================
