@@ -116,91 +116,66 @@ def calcular_impuesto_renta(regimen_empresa, total_ingresos, utilidad_antes_impu
 # EXTRACTOR DE DATOS FEL SAT GUATEMALA
 # ==========================================
 def extraer_datos_dte_sat(archivo_pdf):
-    if not PdfReader:
-        return {}
-    try:
-        lector = PdfReader(archivo_pdf)
-        texto = ""
-        for pagina in lector.pages:
-            t = pagina.extract_text()
-            if t:
-                texto += t + "\n"
-    except Exception:
-        return {}
+    reader = PdfReader(archivo_pdf)
+    texto = "\n".join([page.extract_text() or "" for page in reader.pages])
+    datos = {}
 
-    datos = {
-        "numero_dte": "",
-        "serie": "",
-        "fecha": date.today(),
-        "emisor_nombre": "",
-        "emisor_nit": "",
-        "receptor_nombre": "",
-        "receptor_nit": "",
-        "total": 0.0,
-        "es_pequeno": False
-    }
-
-    if re.search(r'Pequeño\s+Contribuyente|No\s+genera\s+derecho\s+a\s+cr[eé]dito\s+fiscal', texto, re.I):
-        datos["es_pequeno"] = True
-
-    m_aut = re.search(r'(?:NÚMERO DE AUTORIZACIÓN|Autorización|UUID)[\s:\n\r]+([A-F0-9\-]{36}|[A-F0-9]{32})', texto, re.I)
+    # 1. Número de Autorización / DTE
+    m_aut = re.search(r"N[ÚU]MERO\s+DE\s+AUTORIZACI[ÓO]N:\s*\n*([A-F0-9\-]{30,40})", texto, re.IGNORECASE)
     if m_aut:
         datos["numero_dte"] = m_aut.group(1).strip()
-
-    m_ser = re.search(r'(?:SERIE|Serie)[\s:\n\r]+([A-F0-9]+)', texto)
-    if m_ser:
-        datos["serie"] = m_ser.group(1).strip()
-
-    m_num = re.search(r'(?:N[uú]mero\s+de\s+DTE|N[UÚ]MERO\s+DTE)[\s:\n\r]+([0-9]+)', texto, re.I)
-    if m_num and not datos["numero_dte"]:
-        datos["numero_dte"] = m_num.group(1).strip()
-
-    meses = {"ene": 1, "feb": 2, "mar": 3, "abr": 4, "may": 5, "jun": 6, "jul": 7, "ago": 8, "sep": 9, "oct": 10, "nov": 11, "dic": 12}
-    m_fec_txt = re.search(r'Fecha(?:\s+y\s+hora)?\s+de\s+emisi[oó]n[\s:\n\r]+(\d{1,2})-([a-zA-Z]{3})-(\d{4})', texto, re.I)
-    if m_fec_txt:
-        d, mes_str, y = m_fec_txt.groups()
-        mes_num = meses.get(mes_str.lower()[:3], 1)
-        try:
-            datos["fecha"] = date(int(y), mes_num, int(d))
-        except Exception:
-            pass
     else:
-        m_fec = re.search(r'(\d{4}-\d{2}-\d{2}|\d{2}/\d{2}/\d{4})', texto)
-        if m_fec:
-            f_str = m_fec.group(1)
-            try:
-                if "-" in f_str:
-                    datos["fecha"] = datetime.strptime(f_str, "%Y-%m-%d").date()
-                else:
-                    datos["fecha"] = datetime.strptime(f_str, "%d/%m/%Y").date()
-            except Exception:
-                pass
+        m_dte = re.search(r"N[úu]mero\s+de\s+DTE:\s*([0-9]+)", texto)
+        datos["numero_dte"] = m_dte.group(1).strip() if m_dte else ""
 
-    m_nem = re.search(r'Nit\s+Emisor[\s:\n\r]+([0-9Kk\-]+)', texto, re.I)
-    if m_nem:
-        datos["emisor_nit"] = m_nem.group(1).replace("-", "").strip().upper()
+    # 2. Serie
+    m_ser = re.search(r"Serie:\s*([A-F0-9]+)", texto, re.IGNORECASE)
+    datos["serie"] = m_ser.group(1).strip() if m_ser else ""
 
-    m_nomem = re.search(r'(?:Nombre\s*(?:del)?\s*Emisor|Emisor)[\s:\n\r]+([^\n\r]+)', texto, re.I)
-    if m_nomem:
-        datos["emisor_nombre"] = m_nomem.group(1).strip()
+    # 3. Fecha de Emisión
+    m_fec = re.search(r"Fecha(?:\s+y\s+hora)?\s+de\s+emisi[óo]n:\s*([0-9]{4}-[0-9]{2}-[0-9]{2}|[0-9]{2}/[0-9]{2}/[0-9]{4})", texto, re.IGNORECASE)
+    if m_fec:
+        raw_f = m_fec.group(1).strip()
+        try:
+            if "-" in raw_f:
+                datos["fecha"] = datetime.strptime(raw_f, "%Y-%m-%d").date()
+            else:
+                datos["fecha"] = datetime.strptime(raw_f, "%d/%m/%Y").date()
+        except Exception:
+            datos["fecha"] = date.today()
+    else:
+        datos["fecha"] = date.today()
 
-    m_nrec = re.search(r'NIT\s+Receptor[\s:\n\r]+([0-9Kk\-]+|CF|C/?F)', texto, re.I)
-    if m_nrec:
-        r_nit = m_nrec.group(1).replace("-", "").strip().upper()
-        datos["receptor_nit"] = "CF" if r_nit in ["CF", "C/F"] else r_nit
+    # 4. NIT Emisor (Proveedor en Compras)
+    m_nit = re.search(r"Nit\s+Emisor:\s*([0-9A-Z]+)", texto, re.IGNORECASE)
+    datos["emisor_nit"] = m_nit.group(1).strip() if m_nit else ""
 
-    m_nomrec = re.search(r'(?:Nombre\s*(?:del)?\s*Receptor|Receptor)[\s:\n\r]+([^\n\r]+)', texto, re.I)
-    if m_nomrec:
-        datos["receptor_nombre"] = m_nomrec.group(1).strip()
-    elif datos["receptor_nit"] == "CF":
-        datos["receptor_nombre"] = "CONSUMIDOR FINAL"
+    # 5. Nombre Proveedor (Corta antes de firmas, certificadores o leyendas SAT)
+    m_nom = re.search(r"Nombre\s+Emisor:\s*([^\n\r]+)", texto, re.IGNORECASE)
+    if not m_nom:
+        m_nom = re.search(r"(?:EMISOR|DATOS DEL EMISOR)[\s:]*\n*([^\n\r]+)", texto, re.IGNORECASE)
+    
+    if m_nom:
+        nom_limpio = m_nom.group(1).strip()
+        # Filtro estricto: cortar si se cuela la firma o certificador
+        for corte in ["FIRMA", "CERTIFICADOR", "DOCUMENTO TRIBUTARIO", "AUTORIZACIÓN", "NIT:"]:
+            if corte in nom_limpio.upper():
+                nom_limpio = nom_limpio.upper().split(corte)[0].strip()
+        datos["emisor_nombre"] = nom_limpio
+    else:
+        datos["emisor_nombre"] = ""
 
-    montos = re.findall(r'(?:TOTAL(?:ES)?|Gran\s+Total|Total\s+General)[\s:\n\r]*(?:Q|GTQ)?\s*([\d,]+\.\d{2})', texto, re.I)
-    if montos:
-        datos["total"] = float(montos[-1].replace(",", ""))
+    # 6. Total y Subtotal
+    m_tot = re.search(r"TOTAL:?\s*Q?\.?\s*([0-9,]+\.[0-9]{2})", texto, re.IGNORECASE)
+    if m_tot:
+        val_tot = float(m_tot.group(1).replace(",", ""))
+        datos["total"] = val_tot
+        datos["subtotal"] = round(val_tot / 1.12, 2)
+    else:
+        datos["total"] = 0.0
+        datos["subtotal"] = 0.0
 
     return datos
-
 # ==========================================
 # EXPORTACIÓN PDF FISCAL Y REPORTES
 # ==========================================
@@ -429,213 +404,84 @@ if selected_menu == "📊 Resumen General":
 # ==========================================
 # 2. FACTURA DE COMPRAS
 # ==========================================
-elif selected_menu == "🛒 Factura de Compras":
-    if not selected_emp_id: st.stop()
-    st.title(f"🛒 Facturas de Compras — {selected_empresa_info[1]}")
+elif selected_menu in ["👥 Directorio de Terceros", "🏢 Directorio Corporativo (Clientes/Proveedores)"]:
+    st.title("👥 Directorio Corporativo de Clientes y Proveedores")
+    st.caption("Los terceros registrados aquí están disponibles globalmente para todas tus empresas.")
 
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT codigo, nombre FROM nomenclatura WHERE empresa_id = %s AND (tipo = 'Gasto' OR tipo = 'Activo') ORDER BY codigo", (str(selected_emp_id),))
-    cuentas_gasto = c.fetchall()
-    c.execute("SELECT nit, nombre FROM terceros_corporativos WHERE tipo IN ('PROVEEDOR', 'AMBOS') ORDER BY nombre")
-    prov_corp = c.fetchall()
-    conn.close()
+    tab_nuevo, tab_editar = st.tabs(["➕ Registrar Tercero", "✏️ Consultar y Editar Terceros"])
 
-    opciones_cuentas = [f"{r[0]} - {r[1]}" for r in cuentas_gasto]
-    t_fc_emitir, t_fc_hist = st.tabs(["➕ Registrar Factura de Compra", "📋 Historial y Modificación"])
+    with tab_nuevo:
+        with st.form("form_tercero_corp", clear_on_submit=True):
+            col1, col2, col3 = st.columns(3)
+            t_tipo = col1.selectbox("Clasificación:", ["PROVEEDOR", "CLIENTE", "AMBOS"])
+            t_nit = col2.text_input("NIT (Sin guiones) *").strip().upper()
+            t_nom = col3.text_input("Nombre o Razón Social *").strip()
+            col4, col5 = st.columns(2)
+            t_dir = col4.text_input("Dirección Fiscal")
+            t_tel = col5.text_input("Teléfono")
 
-    with t_fc_emitir:
-        col_m1, col_m2 = st.columns([2, 1])
-        modo_c = col_m1.radio("Método de Ingreso:", ["✍️ Ingreso Manual", "📄 Carga Inteligente PDF (FEL SAT)"], horizontal=True, key="modo_c_rad")
-        tipo_doc_c = col_m2.selectbox("Tipo de Comprobante:", ["Factura Electrónica (FEL SAT)", "Documento No Fiscal (Recibo / Vale de Caja)"], key="tipo_doc_c_sel")
-
-        pre_c = {}
-        dyn_c_key = "c_init"
-        if modo_c == "📄 Carga Inteligente PDF (FEL SAT)":
-            f_pdf_c = st.file_uploader("Sube el PDF emitido por la SAT (FEL):", type=["pdf"], key="pdf_compra_sat")
-            if f_pdf_c:
-                pre_c = extraer_datos_dte_sat(f_pdf_c)
-                dyn_c_key = f"c_{f_pdf_c.name}_{f_pdf_c.size}"
-                if pre_c.get("numero_dte"):
-                    st.success(f"✅ DTE {pre_c['numero_dte']} extraído con éxito.")
-
-        dict_provs = {f"{r[1]} (NIT: {r[0]})": (r[1], r[0]) for r in prov_corp}
-        sel_prov = st.selectbox("Seleccionar Proveedor Corporativo (Opcional):", ["-- Ingresar Manualmente / Usar PDF --"] + list(dict_provs.keys()), key=f"sel_prv_{dyn_c_key}")
-        
-        def_p_nom = dict_provs[sel_prov][0] if sel_prov != "-- Ingresar Manualmente / Usar PDF --" else pre_c.get("emisor_nombre", "")
-        def_p_nit = dict_provs[sel_prov][1] if sel_prov != "-- Ingresar Manualmente / Usar PDF --" else pre_c.get("emisor_nit", "")
-
-        with st.form("form_compra_oficial"):
-            c1, c2, c3 = st.columns(3)
-            num_fac = c1.text_input("Número Factura / DTE / Recibo *", value=pre_c.get("numero_dte", ""), key=f"fc_num_{dyn_c_key}")
-            serie = c2.text_input("Serie", value=pre_c.get("serie", ""), key=f"fc_ser_{dyn_c_key}")
-            fecha_fac = c3.date_input("Fecha de Emisión", value=pre_c.get("fecha") or date.today(), key=f"fc_fec_{dyn_c_key}")
-
-            c4, c5 = st.columns(2)
-            prov_nombre = c4.text_input("Nombre del Proveedor *", value=def_p_nom, key=f"fc_prv_{dyn_c_key}")
-            prov_nit = c5.text_input("NIT del Proveedor *", value=def_p_nit, key=f"fc_nit_{dyn_c_key}")
-
-            st.markdown("---")
-            c6, c7 = st.columns(2)
-            idx_cta_def = 0
-            for idx, item in enumerate(opciones_cuentas):
-                if "5.1.01.01" in item: idx_cta_def = idx; break
-            cuenta_gasto = c6.selectbox("Cuenta Contable (Gasto / Inventario) *", opciones_cuentas if opciones_cuentas else ["5.1.01.01 - Compras de Mercadería"], index=idx_cta_def, key=f"fc_cta_{dyn_c_key}")
-
-            # Selector de Tipo de Pago completo
-            forma_pago_c = c7.selectbox("Tipo de Pago:", [
-                "Contado - Efectivo (Caja General)",
-                "Contado - Transferencia / Depósito (Bancos)",
-                "Contado - Tarjeta Corporativa (Débito/Crédito)",
-                "Crédito (Cuentas por Pagar - Proveedores)"
-            ], key=f"fc_fp_{dyn_c_key}")
-
-            monto_total_ingresado = st.number_input("Monto Total Factura (Q) *", min_value=0.0, step=50.0, format="%.2f", value=float(pre_c.get("total", 0.0)), key=f"fc_tot_{dyn_c_key}")
-
-            es_no_fiscal = "No Fiscal" in tipo_doc_c
-            es_pequeno_prov = st.checkbox("¿Proveedor es Pequeño Contribuyente o No Fiscal? (Sin Crédito IVA)", value=pre_c.get("es_pequeno", es_no_fiscal), key=f"fc_peq_{dyn_c_key}")
-
-            r1, r2 = st.columns(2)
-            aplica_isr_c = r1.checkbox("Practicamos Retención de ISR", value=False, key=f"fc_risr_{dyn_c_key}")
-            tipo_isr_c = r1.selectbox("Tasa ISR Retenida", ["No Aplica", "5% General", "7% Excedente (Sobre Q30k)"], key=f"fc_tisr_{dyn_c_key}")
-
-            aplica_iva_c = r2.checkbox("Practicamos Retención de IVA", value=False, key=f"fc_riva_{dyn_c_key}")
-            tipo_iva_c = r2.selectbox("Tasa IVA Retenida", ["No Aplica / No es Agente Retenedor", "15% Retención IVA (Decreto 20-2006)", "100% Retención Total IVA"], key=f"fc_tiva_{dyn_c_key}")
-
-            tot_c = float(monto_total_ingresado)
-            if es_pequeno_prov or es_no_fiscal:
-                sub_c = tot_c
-                iva_c = 0.0
-            else:
-                sub_c = round(tot_c / 1.12, 2)
-                iva_c = round(tot_c - sub_c, 2)
-
-            m_isr_c = 0.0
-            t_isr_c = 0.0
-            if aplica_isr_c and sub_c >= 2800.0 and tipo_isr_c != "No Aplica":
-                t_isr_c = 0.05 if "5%" in tipo_isr_c else 0.07
-                m_isr_c = round(sub_c * 0.05, 2) if "5%" in tipo_isr_c else round(1500.0 + (sub_c - 30000.0) * 0.07, 2)
-
-            m_iva_c = 0.0
-            t_iva_c = 0.0
-            if aplica_iva_c and iva_c > 0 and "No Aplica" not in tipo_iva_c:
-                t_iva_c = 0.15 if "15%" in tipo_iva_c else 1.0
-                m_iva_c = round(iva_c * 0.15, 2) if "15%" in tipo_iva_c else round(iva_c, 2)
-
-            liq_c = round(tot_c - m_isr_c - m_iva_c, 2)
-
-            st.markdown(f"**Base Imponible:** Q {sub_c:,.2f} | **IVA Crédito:** Q {iva_c:,.2f} | **Total:** Q {tot_c:,.2f} | **Líquido a Pagar:** Q {liq_c:,.2f}")
-
-            btn_guardar_c = st.form_submit_button("Guardar Factura de Compra y Asentar", type="primary")
-
-            if btn_guardar_c:
-                if not num_fac.strip() or not prov_nombre.strip() or not prov_nit.strip() or tot_c <= 0:
-                    st.error("⚠️ Completa los campos obligatorios: Número DTE, Proveedor, NIT y Monto mayor a 0.")
-                else:
+            if st.form_submit_button("Guardar en Directorio", type="primary"):
+                if t_nit and t_nom:
+                    conn = get_db_connection()
+                    c = conn.cursor()
                     try:
-                        conn = get_db_connection()
-                        c = conn.cursor()
-                        now_str = datetime.now().isoformat()
-                        fac_id = f"fac-c-{int(datetime.now().timestamp())}"
-                        es_credito = forma_pago_c.startswith("Crédito")
-                        
-                        if es_credito:
-                            cta_salida = "2.1.01.01 - Proveedores / Cuentas por Pagar"
-                        elif "Bancos" in forma_pago_c:
-                            cta_salida = "1.1.01.02 - Bancos"
-                        elif "Tarjeta" in forma_pago_c:
-                            cta_salida = "2.1.01.02 - Tarjetas de Crédito Corporativas por Pagar"
-                        else:
-                            cta_salida = "1.1.01.01 - Caja General (Efectivo)"
-
-                        c.execute("""
-                            INSERT INTO facturas (
-                                id, empresa_id, tipo, numero_factura, serie, fecha,
-                                tercero_nombre, tercero_nit, descripcion, tipo_gasto_ingreso,
-                                subtotal, iva, total, aplica_ret_isr, tasa_ret_isr, monto_ret_isr,
-                                aplica_ret_iva, tasa_ret_iva, monto_ret_iva, total_a_pagar_cobrar,
-                                saldo_pendiente, estado_pago, created_by, created_at,
-                                cuenta_nomenclatura, cuenta_pago, forma_pago
-                            ) VALUES (%s, %s, 'COMPRA', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        """, (
-                            fac_id, str(selected_emp_id), str(num_fac).strip(), str(serie).strip(), str(fecha_fac),
-                            str(prov_nombre).strip(), str(prov_nit).strip().upper(), tipo_doc_c, "Gasto",
-                            float(sub_c), float(iva_c), float(tot_c),
-                            1 if aplica_isr_c else 0, float(t_isr_c), float(m_isr_c),
-                            1 if aplica_iva_c else 0, float(t_iva_c), float(m_iva_c),
-                            float(liq_c), float(liq_c if es_credito else 0.0), "PENDIENTE" if es_credito else "PAGADO",
-                            str(curr_u['username']), str(now_str),
-                            str(cuenta_gasto), str(cta_salida), str(forma_pago_c)
-                        ))
-
-                        try:
-                            c.execute("""
-                                INSERT INTO terceros_corporativos (id, nit, nombre, tipo, direccion, telefono, email, created_at)
-                                VALUES (%s, %s, %s, 'PROVEEDOR', 'Ciudad', '', '', %s)
-                                ON CONFLICT (nit) DO UPDATE SET nombre = EXCLUDED.nombre
-                            """, (f"terc-{int(datetime.now().timestamp())}", str(prov_nit).strip().upper(), str(prov_nombre).strip(), str(now_str)))
-                        except Exception:
-                            pass
-
-                        c.execute("SELECT COALESCE(MAX(partida_no), 0) + 1 FROM libro_diario WHERE empresa_id = %s", (str(selected_emp_id),))
-                        p_no = int(c.fetchone()[0])
-                        glosa = f"Factura Compra {num_fac} de {prov_nombre}"
-
-                        cod_g, nom_g = cuenta_gasto.split(" - ", 1) if " - " in cuenta_gasto else (cuenta_gasto, cuenta_gasto)
-                        cod_s, nom_s = cta_salida.split(" - ", 1) if " - " in cta_salida else (cta_salida, cta_salida)
-
-                        q_ld = """
-                            INSERT INTO libro_diario (empresa_id, partida_no, fecha, codigo_cuenta, nombre_cuenta, debe, haber, concepto, referencia_id, created_at)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        """
-                        c.execute(q_ld, (str(selected_emp_id), p_no, str(fecha_fac), str(cod_g), str(nom_g), float(sub_c), 0.0, glosa, str(num_fac), str(now_str)))
-                        if iva_c > 0:
-                            c.execute(q_ld, (str(selected_emp_id), p_no, str(fecha_fac), "1.1.03.01", "IVA por Cobrar (Crédito Fiscal)", float(iva_c), 0.0, glosa, str(num_fac), str(now_str)))
-                        if m_isr_c > 0:
-                            c.execute(q_ld, (str(selected_emp_id), p_no, str(fecha_fac), "2.1.03.01", "Retenciones ISR por Pagar", 0.0, float(m_isr_c), glosa, str(num_fac), str(now_str)))
-                        if m_iva_c > 0:
-                            c.execute(q_ld, (str(selected_emp_id), p_no, str(fecha_fac), "2.1.03.02", "Retenciones IVA por Pagar", 0.0, float(m_iva_c), glosa, str(num_fac), str(now_str)))
-                        c.execute(q_ld, (str(selected_emp_id), p_no, str(fecha_fac), str(cod_s), str(nom_s), 0.0, float(liq_c), glosa, str(num_fac), str(now_str)))
-
+                        c.execute('''
+                            INSERT INTO terceros_corp (id, tipo, nit, nombre, direccion, telefono, created_at)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        ''', (f"terc-{int(datetime.now().timestamp())}", t_tipo, t_nit, t_nom, t_dir, t_tel, datetime.now().isoformat()))
                         conn.commit()
-                        conn.close()
-                        st.success("✅ Factura de compra registrada y asentada en el Libro Diario.")
+                        st.success(f"✅ Tercero '{t_nom}' registrado corporativamente.")
                         st.rerun()
-                    except Exception as err:
-                        st.error(f"❌ Error al guardar en base de datos: {err}")
+                    except psycopg2.IntegrityError:
+                        st.error("Ya existe un tercero registrado con este NIT.")
+                    finally:
+                        conn.close()
+                else:
+                    st.error("El NIT y el Nombre son obligatorios.")
 
-    with t_fc_hist:
+    with tab_editar:
         conn = get_db_connection()
-        df_c_hist = pd.read_sql_query("""
-            SELECT id, fecha AS "Fecha", serie AS "Serie", numero_factura AS "No. Factura",
-                   tercero_nombre AS "Proveedor", subtotal AS "Base (Q)", iva AS "IVA (Q)",
-                   total AS "Total (Q)", total_a_pagar_cobrar AS "Líquido (Q)",
-                   forma_pago AS "Forma Pago", estado_pago AS "Estado"
-            FROM facturas WHERE empresa_id = %s AND tipo = 'COMPRA'
-            ORDER BY fecha DESC, created_at DESC
-        """, conn, params=(str(selected_emp_id),))
+        df_terc = pd.read_sql_query("SELECT id, tipo, nit, nombre, direccion, telefono FROM terceros_corp ORDER BY nombre ASC", conn)
         conn.close()
 
-        if not df_c_hist.empty:
-            st.dataframe(df_c_hist, use_container_width=True)
-            if is_admin:
-                with st.expander("🗑️ Eliminar Factura de Compra (Solo Administrador)"):
-                    del_c_id = st.selectbox("Seleccionar factura a eliminar:", df_c_hist['id'].tolist(),
-                                            format_func=lambda x: f"Fac {df_c_hist[df_c_hist['id']==x]['No. Factura'].values[0]} - {df_c_hist[df_c_hist['id']==x]['Proveedor'].values[0]}")
-                    if st.button("Confirmar Eliminación Definitiva Compra", type="secondary"):
+        if not df_terc.empty:
+            dict_edit = {f"{r['nombre']} (NIT: {r['nit']})": r['id'] for _, r in df_terc.iterrows()}
+            sel_terc_label = st.selectbox("Selecciona un tercero para editar:", list(dict_edit.keys()))
+            terc_id_sel = dict_edit[sel_terc_label]
+            datos_sel = df_terc[df_terc['id'] == terc_id_sel].iloc[0]
+
+            with st.form("form_edit_terc"):
+                st.markdown(f"#### Editando datos de: **{datos_sel['nombre']}**")
+                e_col1, e_col2, e_col3 = st.columns(3)
+                e_tipo = e_col1.selectbox("Clasificación:", ["PROVEEDOR", "CLIENTE", "AMBOS"], index=["PROVEEDOR", "CLIENTE", "AMBOS"].index(datos_sel['tipo']))
+                e_nit = e_col2.text_input("NIT (Sin guiones) *", value=datos_sel['nit']).strip().upper()
+                e_nom = e_col3.text_input("Nombre o Razón Social *", value=datos_sel['nombre']).strip()
+                
+                e_col4, e_col5 = st.columns(2)
+                e_dir = e_col4.text_input("Dirección Fiscal", value=datos_sel['direccion'] or "")
+                e_tel = e_col5.text_input("Teléfono", value=datos_sel['telefono'] or "")
+
+                if st.form_submit_button("💾 Guardar Cambios", type="primary"):
+                    if e_nit and e_nom:
                         conn = get_db_connection()
                         c = conn.cursor()
-                        c.execute("SELECT numero_factura FROM facturas WHERE id = %s", (del_c_id,))
-                        row_f = c.fetchone()
-                        if row_f:
-                            c.execute("DELETE FROM libro_diario WHERE empresa_id = %s AND (referencia_id = %s OR concepto LIKE %s)", (str(selected_emp_id), str(row_f[0]), f"%{row_f[0]}%"))
-                        c.execute("DELETE FROM facturas WHERE id = %s", (del_c_id,))
+                        c.execute('''
+                            UPDATE terceros_corp 
+                            SET tipo = %s, nit = %s, nombre = %s, direccion = %s, telefono = %s 
+                            WHERE id = %s
+                        ''', (e_tipo, e_nit, e_nom, e_dir, e_tel, terc_id_sel))
                         conn.commit()
                         conn.close()
-                        st.success("Compra y partida eliminadas.")
+                        st.success(f"Datos de '{e_nom}' actualizados correctamente.")
                         st.rerun()
+                    else:
+                        st.error("El NIT y el Nombre son obligatorios.")
+
+            st.markdown("---")
+            st.markdown("### Directorio Completo")
+            st.dataframe(df_terc[['tipo', 'nit', 'nombre', 'direccion', 'telefono']], use_container_width=True)
         else:
-            st.info("No hay facturas de compras registradas.")
+            st.info("No hay terceros registrados aún.")
 
 # ==========================================
 # 3. FACTURA DE VENTAS
