@@ -319,6 +319,8 @@ def _parse_texto_dte(texto):
         datos["receptor_nombre"] = "CONSUMIDOR FINAL"
 
     datos["total"] = _extraer_total(texto)
+    datos["idp_doc"] = 0.0
+    datos["idp_mencionado"] = bool(re.search(r"\bIDP\b|Distribuci[oó]n\s+de\s+Petr[oó]leo|\bPETR[OÓ]LEO\b", texto, re.I))
     datos["texto"] = texto
     datos["faltantes"] = [n for n, k in (("Número DTE", "numero_dte"), ("Fecha", "fecha"), ("NIT emisor", "emisor_nit"),
                                           ("Nombre emisor", "emisor_nombre"), ("Total", "total")) if not datos.get(k)]
@@ -397,12 +399,19 @@ def _extraer_datos_xml(data):
             datos["total"] = _a_float(gt.text.strip())
         except Exception:
             pass
+    datos["idp_doc"] = 0.0
     for el in root.iter():
-        if local(el.tag) == "TotalImpuesto" and str(el.attrib.get("NombreCorto", "")).upper() == "IVA":
+        if local(el.tag) == "TotalImpuesto":
+            nombre_imp = str(el.attrib.get("NombreCorto", "")).upper()
             try:
-                datos["iva_doc"] = _a_float(el.attrib.get("TotalMontoImpuesto", "0"))
+                monto_imp = _a_float(el.attrib.get("TotalMontoImpuesto", "0"))
             except Exception:
-                pass
+                continue
+            if nombre_imp == "IVA":
+                datos["iva_doc"] = monto_imp
+            elif nombre_imp.startswith("PETR") or nombre_imp.startswith("IDP"):
+                datos["idp_doc"] += monto_imp
+    datos["idp_mencionado"] = datos["idp_doc"] > 0
     datos["faltantes"] = [n for n, k in (("Número DTE", "numero_dte"), ("Fecha", "fecha"), ("NIT emisor", "emisor_nit"),
                                           ("Nombre emisor", "emisor_nombre"), ("Total", "total")) if not datos.get(k)]
     return datos
@@ -510,9 +519,11 @@ def listar_proveedores(empresa_id):
     base = base[base["nit_key"] != ""].drop_duplicates(subset="nit_key")
     return base.sort_values("nombre").reset_index(drop=True)
 
-def registrar_partida_compra(c, empresa_id, fecha, cod_d, nom_d, cod_h, nom_h, sub, iva, m_isr, m_iva, liq, num_fac, prov_nombre, now_str, factura_id=None):
-    """Asienta la compra en el Libro Diario usando el mismo cursor/transacción de la factura."""
-    debe_total = round(float(sub) + float(iva), 2)
+def registrar_partida_compra(c, empresa_id, fecha, cod_d, nom_d, cod_h, nom_h, sub, iva, m_isr, m_iva, liq, num_fac, prov_nombre, now_str,
+                             factura_id=None, idp=0.0, cod_idp=None, nom_idp=None):
+    """Asienta la compra en el Libro Diario usando el mismo cursor/transacción de la factura (incluye IDP si existe)."""
+    idp = float(idp or 0.0)
+    debe_total = round(float(sub) + float(iva) + idp, 2)
     haber_total = round(float(m_isr) + float(m_iva) + float(liq), 2)
     if abs(debe_total - haber_total) > 0.01:
         raise ValueError(f"La partida no cuadra: Debe Q{debe_total:,.2f} vs Haber Q{haber_total:,.2f}")
@@ -527,12 +538,107 @@ def registrar_partida_compra(c, empresa_id, fecha, cod_d, nom_d, cod_h, nom_h, s
     c.execute(q_ld, (str(empresa_id), p_no, f, str(cod_d), str(nom_d), float(sub), 0.0, glosa, str(num_fac), now_str))
     if iva > 0:
         c.execute(q_ld, (str(empresa_id), p_no, f, "1.1.03.01", "IVA por Cobrar (Crédito Fiscal)", float(iva), 0.0, glosa, str(num_fac), now_str))
+    if idp > 0:
+        c.execute(q_ld, (str(empresa_id), p_no, f, str(cod_idp or cod_d), str(nom_idp or nom_d), idp, 0.0, f"{glosa} (IDP)", str(num_fac), now_str))
     if m_isr > 0:
         c.execute(q_ld, (str(empresa_id), p_no, f, "2.1.03.01", "Retenciones ISR por Pagar", 0.0, float(m_isr), glosa, str(num_fac), now_str))
     if m_iva > 0:
         c.execute(q_ld, (str(empresa_id), p_no, f, "2.1.03.02", "Retenciones IVA por Pagar", 0.0, float(m_iva), glosa, str(num_fac), now_str))
     c.execute(q_ld, (str(empresa_id), p_no, f, str(cod_h), str(nom_h), 0.0, float(liq), glosa, str(num_fac), now_str))
     return p_no
+
+# ==========================================
+# INVENTARIO RÁPIDO DESDE COMPRAS
+# ==========================================
+def asegurar_esquema():
+    """Agrega (una sola vez) la columna IDP y la tabla de líneas de inventario. No altera datos existentes."""
+    if "schema_idp" in st.session_state and "schema_items" in st.session_state:
+        return
+    for flag, sql in (
+        ("schema_idp", "ALTER TABLE facturas ADD COLUMN IF NOT EXISTS idp NUMERIC DEFAULT 0"),
+        ("schema_items", """CREATE TABLE IF NOT EXISTS factura_items (
+                id TEXT PRIMARY KEY, factura_id TEXT NOT NULL, empresa_id TEXT NOT NULL, producto_id TEXT,
+                descripcion TEXT, cantidad NUMERIC DEFAULT 0, costo_total NUMERIC DEFAULT 0, created_at TEXT)"""),
+    ):
+        conn = None
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute(sql)
+            conn.commit()
+            conn.close()
+            st.session_state[flag] = True
+        except Exception:
+            try:
+                if conn:
+                    conn.rollback()
+                    conn.close()
+            except Exception:
+                pass
+            st.session_state[flag] = False
+
+def repartir_costos(totales, base):
+    """Reparte la base de la factura entre las líneas de inventario según el peso de cada línea."""
+    totales = [max(float(t or 0.0), 0.0) for t in totales]
+    n = len(totales)
+    if n == 0:
+        return []
+    s = sum(totales)
+    pesos = [t / s for t in totales] if s > 0 else [1.0 / n] * n
+    costos = [round(float(base) * w, 2) for w in pesos]
+    costos[-1] = round(float(base) - sum(costos[:-1]), 2)
+    return costos
+
+def siguiente_codigo_producto(df_productos):
+    try:
+        nums = [int(re.sub(r"\D", "", str(x))) for x in df_productos["codigo"] if re.sub(r"\D", "", str(x))]
+        return str(max(nums) + 1) if nums else "1"
+    except Exception:
+        return str(len(df_productos) + 1)
+
+def crear_producto_db(empresa_id, codigo, descripcion, precio_venta=0.0):
+    """Crea un producto en el catálogo del Kárdex (misma lógica del módulo Kárdex). Devuelve (id, error)."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS productos (
+                id TEXT PRIMARY KEY, empresa_id TEXT, codigo TEXT NOT NULL, descripcion TEXT NOT NULL,
+                existencia NUMERIC DEFAULT 0, costo_promedio NUMERIC DEFAULT 0, precio_venta NUMERIC DEFAULT 0, created_at TEXT
+            );
+        """)
+        c.execute("SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'productos'")
+        info = c.fetchall()
+        nombres = [r[0].lower() for r in info]
+        tipos = {r[0].lower(): r[1].lower() for r in info}
+        c.execute("SELECT 1 FROM productos WHERE codigo = %s", (str(codigo).strip(),))
+        if c.fetchone():
+            conn.rollback(); conn.close()
+            return None, f"Ya existe un producto con el código {codigo}."
+        ts = int(datetime.now().timestamp())
+        campos, valores = [], []
+        pid = None
+        if "id" in nombres:
+            t_id = tipos.get("id", "")
+            pid = (ts % 2147483647) if ("int" in t_id or "serial" in t_id) else f"prod-{ts}-{uuid.uuid4().hex[:4]}"
+            campos.append("id"); valores.append(pid)
+        if "empresa_id" in nombres:
+            campos.append("empresa_id"); valores.append(str(empresa_id) if empresa_id else "global")
+        campos += ["codigo", "descripcion", "existencia", "costo_promedio", "precio_venta"]
+        valores += [str(codigo).strip(), str(descripcion).strip(), 0.0, 0.0, float(precio_venta or 0.0)]
+        if "created_at" in nombres:
+            campos.append("created_at"); valores.append(datetime.now().isoformat())
+        c.execute(f"INSERT INTO productos ({', '.join(campos)}) VALUES ({', '.join(['%s'] * len(campos))})", tuple(valores))
+        conn.commit(); conn.close()
+        return pid, None
+    except Exception as e:
+        try:
+            if conn:
+                conn.rollback(); conn.close()
+        except Exception:
+            pass
+        return None, str(e)
 
 # ==========================================
 # EXPORTACIÓN PDF FISCAL Y REPORTES
@@ -723,6 +829,7 @@ def refrescar_usuario_sesion():
               "role": row[4], "status": row[5], "assigned_empresas": row[6]})
 
 refrescar_usuario_sesion()
+asegurar_esquema()
 curr_u = st.session_state.user
 is_admin = curr_u["role"] == "admin"
 
@@ -819,6 +926,10 @@ elif selected_menu in ["🛒 Factura de Compras", "🛒 Compras y Gastos"]:
 
     if "c_nonce" not in st.session_state:
         st.session_state.c_nonce = 0
+    if "c_lineas" not in st.session_state:
+        st.session_state.c_lineas = []
+    if "c_line_nonce" not in st.session_state:
+        st.session_state.c_line_nonce = 0
 
     t_fc_reg, t_fc_hist = st.tabs(["➕ Registrar Compra / Gasto", "📋 Historial de Compras"])
 
@@ -834,6 +945,7 @@ elif selected_menu in ["🛒 Factura de Compras", "🛒 Compras y Gastos"]:
 
         opciones_debe = [f"{r['codigo']} - {r['nombre']}" for _, r in cuentas_gasto.iterrows()]
         opciones_haber = [f"{r['codigo']} - {r['nombre']}" for _, r in cuentas_pasivo_pago.iterrows()]
+        lista_cuentas_debe = opciones_debe if opciones_debe else ["5.1.01.01 - Compras de Mercadería"]
 
         # Selector de modalidad: Documento Fiscal (PDF/Manual) o No Fiscal (Vales/Recibos)
         tipo_doc = st.radio("Tipo de Documento:", ["📄 Factura DTE / Fiscal SAT", "🧾 Documento No Fiscal (Vale / Recibo)"], horizontal=True, key="c_tipodoc")
@@ -882,28 +994,108 @@ elif selected_menu in ["🛒 Factura de Compras", "🛒 Compras y Gastos"]:
             st.markdown("---")
             tipo_adquisicion = st.radio("Tipo de Adquisición Contable:", ["🛍️ Bien (Mercadería / Activo Fijo)", "🛠️ Servicio"], horizontal=True, key="fc_tipoadq")
 
-            prod_sel_id = None
-            cant_unidades = 0
             es_inventario = False
+            lineas = st.session_state.c_lineas
 
             if tipo_adquisicion == "🛍️ Bien (Mercadería / Activo Fijo)":
-                c_bien1, c_bien2 = st.columns(2)
-                destino_bien = c_bien1.selectbox("Destino del Bien:", ["Mercadería para Inventario (Kárdex)", "Activo Fijo / Uso Operativo"], key="fc_dest_bien")
+                destino_bien = st.selectbox("Destino del Bien:", ["Mercadería para Inventario (Kárdex)", "Activo Fijo / Uso Operativo"], key="fc_dest_bien")
 
                 if destino_bien == "Mercadería para Inventario (Kárdex)":
                     es_inventario = True
-                    dict_prods = {f"[{r['codigo']}] {r['descripcion']} (Stock: {r['existencia']})": r['id'] for _, r in productos_bd.iterrows()}
-                    opciones_k = ["-- Seleccionar Producto del Catálogo --"] + list(dict_prods.keys())
-                    sel_p = c_bien2.selectbox("Producto a Ingresar en Kárdex:", opciones_k, key="fc_prod_k")
+                    ln = st.session_state.c_line_nonce
 
-                    col_u1, col_u2 = st.columns(2)
-                    cant_unidades = col_u1.number_input("Cantidad de Unidades a Ingresar *", min_value=1, step=1, value=1, key="fc_cant_inv")
+                    st.markdown("#### 📦 Productos que ingresan al Kárdex")
+                    st.caption("Agrega una línea por cada producto de la factura. Puedes agregar todas las que necesites.")
 
-                    if sel_p != "-- Seleccionar Producto del Catálogo --":
-                        prod_sel_id = dict_prods[sel_p]
+                    # ---- Buscador de producto ----
+                    buscar_prod = st.text_input("🔎 Buscar producto (nombre o código)", key=f"fc_busq_{ln}", placeholder="Escribe parte del nombre...")
+                    q_busq = buscar_prod.strip()
+                    if q_busq and not productos_bd.empty:
+                        patron_b = re.escape(q_busq)
+                        df_filtrado = productos_bd[productos_bd["descripcion"].astype(str).str.contains(patron_b, case=False, na=False)
+                                                   | productos_bd["codigo"].astype(str).str.contains(patron_b, case=False, na=False)]
                     else:
-                        st.info("💡 Si el producto aún no existe, regístralo previamente en el módulo Control de Inventarios (Kárdex).")
+                        df_filtrado = productos_bd
 
+                    dict_prods = {f"[{r['codigo']}] {r['descripcion']} (Stock: {r['existencia']})": r['id'] for _, r in df_filtrado.iterrows()}
+                    etiquetas_prod = list(dict_prods.keys())
+                    SENT_PROD = "-- Seleccionar Producto --"
+                    opciones_k = [SENT_PROD] + etiquetas_prod
+
+                    # Selección automática: producto recién creado o única coincidencia de la búsqueda
+                    idx_prod = 0
+                    prod_pre = st.session_state.get("c_prod_sel")
+                    if prod_pre is not None:
+                        for i_k, lbl_k in enumerate(etiquetas_prod, start=1):
+                            if str(dict_prods[lbl_k]) == str(prod_pre):
+                                idx_prod = i_k
+                                break
+                    elif q_busq and len(etiquetas_prod) == 1:
+                        idx_prod = 1
+
+                    if q_busq and not etiquetas_prod:
+                        st.warning(f"No hay productos que coincidan con «{q_busq}». Créalo aquí abajo en «Crear producto nuevo».")
+
+                    qsig = hashlib.md5(q_busq.encode()).hexdigest()[:6]
+                    sel_p = st.selectbox("Producto:", opciones_k, index=idx_prod, key=f"fc_prod_k_{ln}_{qsig}_{len(etiquetas_prod)}")
+
+                    # ---- Crear producto nuevo sin salir del módulo ----
+                    with st.expander("➕ ¿El producto no existe? Créalo aquí mismo (se agrega al Kárdex)"):
+                        np1, np2, np3 = st.columns([1, 3, 1.5])
+                        np_cod = np1.text_input("Código", value=siguiente_codigo_producto(productos_bd), key=f"fc_np_cod_{ln}")
+                        np_desc = np2.text_input("Descripción *", value=q_busq, key=f"fc_np_desc_{ln}_{qsig}")
+                        np_prec = np3.number_input("Precio venta Q (opcional)", min_value=0.0, step=10.0, format="%.2f", key=f"fc_np_prec_{ln}")
+                        if st.button("💾 Crear producto y seleccionarlo", key=f"fc_np_btn_{ln}"):
+                            if not np_desc.strip() or not np_cod.strip():
+                                st.error("Código y descripción son obligatorios.")
+                            else:
+                                nuevo_id, err_np = crear_producto_db(selected_emp_id, np_cod.strip(), np_desc.strip(), np_prec)
+                                if err_np:
+                                    st.error(f"❌ {err_np}")
+                                else:
+                                    st.session_state["c_prod_sel"] = nuevo_id
+                                    st.session_state.c_line_nonce += 1
+                                    st.session_state["c_flash_prod"] = f"✅ Producto «{np_desc.strip()}» creado. Ya está seleccionado: indica cantidad y total de la línea."
+                                    st.rerun()
+
+                    if st.session_state.get("c_flash_prod"):
+                        st.success(st.session_state.pop("c_flash_prod"))
+
+                    # ---- Cantidad, total de la línea y botón agregar ----
+                    l1, l2, l3 = st.columns([1.2, 1.6, 1])
+                    cant_linea = l1.number_input("Cantidad *", min_value=0.0, step=1.0, value=1.0, format="%.2f", key=f"fc_lcant_{ln}")
+                    total_linea = l2.number_input("Total de la línea Q (como aparece en la factura)", min_value=0.0, step=10.0, format="%.2f", key=f"fc_ltot_{ln}",
+                                                  help="Déjalo en 0 si la factura tiene un solo producto: se asigna toda la base de la factura.")
+                    l3.markdown("&nbsp;", unsafe_allow_html=True)
+                    if l3.button("➕ Agregar línea", key=f"fc_ladd_{ln}"):
+                        if sel_p == SENT_PROD:
+                            st.error("Selecciona un producto (o créalo) antes de agregar la línea.")
+                        elif cant_linea <= 0:
+                            st.error("La cantidad debe ser mayor a 0.")
+                        else:
+                            st.session_state.c_lineas.append({
+                                "pid": dict_prods[sel_p], "label": sel_p.split(" (Stock:")[0],
+                                "cant": float(cant_linea), "total": float(total_linea)
+                            })
+                            st.session_state.pop("c_prod_sel", None)
+                            st.session_state.c_line_nonce += 1
+                            st.rerun()
+
+                    # ---- Líneas agregadas ----
+                    if lineas:
+                        st.markdown("**Líneas agregadas a esta factura:**")
+                        for i_l, lin in enumerate(lineas):
+                            cl = st.columns([4, 1.3, 1.6, 0.8])
+                            cl[0].write(f"{i_l + 1}. {lin['label']}")
+                            cl[1].write(f"Cant: {lin['cant']:,.2f}")
+                            cl[2].write(f"Q {lin['total']:,.2f}" if lin['total'] > 0 else "Total: base de la factura")
+                            if cl[3].button("❌", key=f"fc_ldel_{i_l}_{ln}"):
+                                st.session_state.c_lineas.pop(i_l)
+                                st.rerun()
+                    else:
+                        st.info("Aún no hay líneas. Agrega al menos un producto para que se actualice el Kárdex.")
+
+            st.markdown("---")
             col_fp1, col_fp2 = st.columns(2)
             tipo_pago = col_fp1.selectbox("Condición de Pago:", ["Contado", "Crédito"], key="fc_tpago")
             metodo_det = ""
@@ -917,30 +1109,74 @@ elif selected_menu in ["🛒 Factura de Compras", "🛒 Compras y Gastos"]:
 
             c6, c7 = st.columns(2)
             cod_d_def = "1.1.04.01" if es_inventario else "5.1.01.01"
-            idx_def_debe = next((i for i, x in enumerate(opciones_debe) if cod_d_def in x), 0)
-            cuenta_debe = c6.selectbox("Cuenta de Cargo / DEBE *", opciones_debe if opciones_debe else ["5.1.01.01 - Compras de Mercadería"], index=idx_def_debe, key=f"fc_cdebe_{cod_d_def}")
+            idx_def_debe = next((i for i, x in enumerate(lista_cuentas_debe) if cod_d_def in x), 0)
+            cuenta_debe = c6.selectbox("Cuenta de Cargo / DEBE *", lista_cuentas_debe, index=idx_def_debe, key=f"fc_cdebe_{cod_d_def}")
             cuenta_haber = c7.selectbox("Cuenta de Abono / HABER *", opciones_haber if opciones_haber else ["2.1.01.01 - Proveedores / Cuentas por Pagar"], index=idx_h, key=f"fc_chaber_{cod_h_def}")
 
             # Ingreso del Total Facturado
             total_ingresado = st.number_input("Total Facturado Q *", min_value=0.0, step=50.0, format="%.2f", value=float(pre_datos.get("total", 0.0) or 0.0), key=f"fc_tot_{base}")
             total_ingresado = float(total_ingresado)
 
-            # ---- Desglose de impuestos ----
             es_pequeno_prov = False
             if not es_no_fiscal:
                 es_pequeno_prov = st.checkbox("¿Proveedor es Pequeño Contribuyente? (Sin Crédito Fiscal IVA)", value=bool(pre_datos.get("es_pequeno", False)), key=f"fc_peq_{base}")
 
+            # ---- IDP (Impuesto a la Distribución de Petróleo) ----
+            monto_idp = 0.0
+            cuenta_idp = cuenta_debe
+            if not es_no_fiscal:
+                idp_doc_val = float(pre_datos.get("idp_doc", 0.0) or 0.0)
+                if pre_datos.get("idp_mencionado") and idp_doc_val <= 0:
+                    st.info("⛽ El documento menciona IDP. Activa la casilla de IDP e ingresa el monto.")
+                tiene_idp = st.checkbox("⛽ La factura incluye IDP (Impuesto a la Distribución de Petróleo / combustibles)", value=idp_doc_val > 0, key=f"fc_idpchk_{base}")
+                if tiene_idp:
+                    i1, i2, i3 = st.columns(3)
+                    galones_idp = i1.number_input("Galones (opcional)", min_value=0.0, step=1.0, format="%.2f", key=f"fc_gal_{base}")
+                    tasa_gal_idp = i2.number_input("IDP por galón Q (opcional)", min_value=0.0, step=0.01, format="%.4f", key=f"fc_tgal_{base}")
+                    idp_manual = i3.number_input("Monto total de IDP Q", min_value=0.0, step=1.0, format="%.2f", value=idp_doc_val, key=f"fc_idpm_{base}")
+                    monto_idp = float(idp_manual) if idp_manual > 0 else round(float(galones_idp) * float(tasa_gal_idp), 2)
+                    idx_cidp = lista_cuentas_debe.index(cuenta_debe) if cuenta_debe in lista_cuentas_debe else 0
+                    csig = hashlib.md5(cuenta_debe.encode()).hexdigest()[:6]
+                    cuenta_idp = st.selectbox("Cuenta contable de cargo del IDP", lista_cuentas_debe, index=idx_cidp, key=f"fc_cidp_{base}_{csig}")
+                    st.caption(f"IDP registrado: Q {monto_idp:,.2f}. El IDP no forma parte de la base del IVA ni genera crédito fiscal; se registra como costo/gasto en la cuenta elegida.")
+                    if monto_idp >= total_ingresado > 0:
+                        st.error("El IDP no puede ser igual o mayor al total facturado.")
+                        monto_idp = 0.0
+
+            # ---- Desglose de impuestos ----
+            base_con_iva = max(total_ingresado - monto_idp, 0.0)
             if es_no_fiscal or es_pequeno_prov:
-                subtotal = total_ingresado
+                subtotal = round(base_con_iva, 2)
                 iva = 0.0
             else:
                 iva_doc = pre_datos.get("iva_doc")
                 if iva_doc is not None and abs(total_ingresado - float(pre_datos.get("total", 0.0) or 0.0)) < 0.01:
                     iva = round(float(iva_doc), 2)          # IVA real tomado del XML de la SAT
-                    subtotal = round(total_ingresado - iva, 2)
+                    subtotal = round(base_con_iva - iva, 2)
                 else:
-                    subtotal = round(total_ingresado / 1.12, 2)
-                    iva = round(total_ingresado - subtotal, 2)
+                    subtotal = round(base_con_iva / 1.12, 2)
+                    iva = round(base_con_iva - subtotal, 2)
+
+            # ---- Resumen de líneas de inventario (reparto del costo) ----
+            costos_lineas = []
+            prorratear_ok = True
+            idp_a_inventario = bool(es_inventario and monto_idp > 0 and str(cuenta_idp).startswith("1.1.04"))
+            base_inventario = round(subtotal + (monto_idp if idp_a_inventario else 0.0), 2)
+            if es_inventario and lineas:
+                costos_lineas = repartir_costos([l["total"] for l in lineas], base_inventario)
+                suma_lineas = round(sum(l["total"] for l in lineas), 2)
+                st.markdown("**Costo que ingresará al Kárdex (sin IVA):**")
+                df_costos = pd.DataFrame([{
+                    "Producto": l["label"], "Cantidad": l["cant"], "Total línea (Q)": l["total"],
+                    "Costo Kárdex (Q)": cst, "Costo unitario (Q)": round(cst / l["cant"], 4) if l["cant"] > 0 else 0.0
+                } for l, cst in zip(lineas, costos_lineas)])
+                st.dataframe(df_costos, use_container_width=True)
+                if len(lineas) > 1 and any(l["total"] <= 0 for l in lineas):
+                    st.error("Con más de una línea, cada línea debe tener su total (> 0) para repartir el costo correctamente.")
+                    prorratear_ok = False
+                elif suma_lineas > 0 and abs(suma_lineas - base_con_iva) > 0.05:
+                    st.warning(f"Las líneas suman Q {suma_lineas:,.2f} y la factura (sin IDP) es Q {base_con_iva:,.2f}. Diferencia: Q {abs(suma_lineas - base_con_iva):,.2f}.")
+                    prorratear_ok = st.checkbox("Prorratear la diferencia entre las líneas (confirmo)", value=False, key=f"fc_prorr_{base}")
 
             aplica_isr = False
             aplica_iva = False
@@ -963,13 +1199,15 @@ elif selected_menu in ["🛒 Factura de Compras", "🛒 Compras y Gastos"]:
             t_isr, m_isr, t_iva, m_iva, liq = ret["t_isr"], ret["m_isr"], ret["t_iva"], ret["m_iva"], ret["liq"]
 
             if not es_no_fiscal:
-                st.info(f"Subtotal: Q{subtotal:,.2f} | IVA: Q{iva:,.2f} | **Total:** Q{total_ingresado:,.2f} | Ret. ISR: Q{m_isr:,.2f} | Ret. IVA: Q{m_iva:,.2f} | **Líquido a Pagar:** Q{liq:,.2f}")
+                txt_idp = f" | IDP: Q{monto_idp:,.2f}" if monto_idp > 0 else ""
+                st.info(f"Subtotal: Q{subtotal:,.2f} | IVA: Q{iva:,.2f}{txt_idp} | **Total:** Q{total_ingresado:,.2f} | Ret. ISR: Q{m_isr:,.2f} | Ret. IVA: Q{m_iva:,.2f} | **Líquido a Pagar:** Q{liq:,.2f}")
 
             # Vista previa del asiento
-            cuenta_debe_txt = cuenta_debe
-            asiento_prev = [{"Cuenta": cuenta_debe_txt, "DEBE": f"Q {subtotal:,.2f}", "HABER": "Q 0.00"}]
+            asiento_prev = [{"Cuenta": cuenta_debe, "DEBE": f"Q {subtotal:,.2f}", "HABER": "Q 0.00"}]
             if iva > 0:
                 asiento_prev.append({"Cuenta": "1.1.03.01 - IVA por Cobrar (Crédito Fiscal)", "DEBE": f"Q {iva:,.2f}", "HABER": "Q 0.00"})
+            if monto_idp > 0:
+                asiento_prev.append({"Cuenta": f"{cuenta_idp} (IDP)", "DEBE": f"Q {monto_idp:,.2f}", "HABER": "Q 0.00"})
             if m_isr > 0:
                 asiento_prev.append({"Cuenta": "2.1.03.01 - Retenciones ISR por Pagar", "DEBE": "Q 0.00", "HABER": f"Q {m_isr:,.2f}"})
             if m_iva > 0:
@@ -993,14 +1231,16 @@ elif selected_menu in ["🛒 Factura de Compras", "🛒 Compras y Gastos"]:
                     st.warning(f"⚠️ Ya existe una compra registrada con el documento {num_fac.strip()} (serie '{serie.strip()}') en esta empresa.")
                     permitir_dup = st.checkbox("Registrar de todos modos (duplicado)", value=False, key=f"fc_dup_{base}")
 
-            if es_inventario and not prod_sel_id:
-                st.warning("⚠️ No seleccionaste un producto del Kárdex: la compra se asentará en Inventario pero NO se actualizarán las existencias.")
+            if es_inventario and not lineas:
+                st.warning("⚠️ No agregaste líneas de producto: la compra se asentará en Inventario pero NO se actualizarán las existencias del Kárdex.")
 
             if st.button("Guardar Factura y Asentar en Diario", type="primary", key="btn_save_c"):
                 if not (num_fac.strip() and prov_nombre.strip() and prov_nit.strip() and total_ingresado > 0):
                     st.error("Completa todos los campos obligatorios y asegúrate de que el total sea mayor a 0.")
                 elif not permitir_dup:
                     st.error("Documento duplicado: marca la casilla para registrarlo de todos modos.")
+                elif es_inventario and lineas and not prorratear_ok:
+                    st.error("Revisa las líneas de inventario: falta el total de alguna línea o confirmar el prorrateo de la diferencia.")
                 else:
                     conn = None
                     try:
@@ -1010,6 +1250,8 @@ elif selected_menu in ["🛒 Factura de Compras", "🛒 Compras y Gastos"]:
                         fac_id = f"fac-c-{int(datetime.now().timestamp())}-{uuid.uuid4().hex[:6]}"
                         es_credito = (tipo_pago == "Crédito")
                         fp_desc = "Crédito" if es_credito else f"Contado ({metodo_det})"
+                        con_columna_idp = bool(st.session_state.get("schema_idp"))
+                        desc_fac = tipo_adquisicion if (con_columna_idp or monto_idp <= 0) else f"{tipo_adquisicion} | IDP Q{monto_idp:,.2f}"
 
                         cols_f = ["id", "empresa_id", "tipo", "numero_factura", "serie", "fecha", "tercero_nombre", "tercero_nit",
                                   "descripcion", "tipo_gasto_ingreso", "cuenta_nomenclatura", "cuenta_pago", "forma_pago",
@@ -1017,13 +1259,16 @@ elif selected_menu in ["🛒 Factura de Compras", "🛒 Compras y Gastos"]:
                                   "aplica_ret_iva", "tasa_ret_iva", "monto_ret_iva", "total_a_pagar_cobrar",
                                   "saldo_pendiente", "estado_pago", "created_by", "created_at"]
                         vals_f = [fac_id, str(selected_emp_id), "COMPRA", num_fac.strip(), serie.strip(), str(fecha_fac),
-                                  prov_nombre.strip(), prov_nit.strip().upper(), tipo_adquisicion, "Gasto",
+                                  prov_nombre.strip(), prov_nit.strip().upper(), desc_fac, "Gasto",
                                   cuenta_debe, cuenta_haber, fp_desc,
                                   float(subtotal), float(iva), float(total_ingresado),
                                   1 if m_isr > 0 else 0, float(t_isr), float(m_isr),
                                   1 if m_iva > 0 else 0, float(t_iva), float(m_iva), float(liq),
                                   float(liq if es_credito else 0.0), "PENDIENTE" if es_credito else "PAGADO",
                                   str(curr_u['username']), now_str]
+                        if con_columna_idp:
+                            cols_f.append("idp")
+                            vals_f.append(float(monto_idp))
                         c.execute(f"INSERT INTO facturas ({', '.join(cols_f)}) VALUES ({', '.join(['%s'] * len(cols_f))})", tuple(vals_f))
 
                         # Directorio de terceros (con savepoint para no abortar la transacción si falla)
@@ -1039,28 +1284,43 @@ elif selected_menu in ["🛒 Factura de Compras", "🛒 Compras y Gastos"]:
                         except Exception:
                             c.execute("ROLLBACK TO SAVEPOINT sp_terc")
 
-                        # Entrada en inventario (costo promedio ponderado)
-                        if es_inventario and prod_sel_id and cant_unidades > 0:
-                            c.execute("SELECT existencia, costo_promedio FROM productos WHERE id = %s", (prod_sel_id,))
-                            p_row = c.fetchone()
-                            if p_row:
+                        # Entradas de inventario: una por cada línea (costo promedio ponderado)
+                        n_lineas_guardadas = 0
+                        if es_inventario and lineas:
+                            costos_final = repartir_costos([l["total"] for l in lineas], base_inventario)
+                            for lin, costo_lin in zip(lineas, costos_final):
+                                c.execute("SELECT existencia, costo_promedio FROM productos WHERE id = %s", (lin["pid"],))
+                                p_row = c.fetchone()
+                                if not p_row:
+                                    raise ValueError(f"El producto «{lin['label']}» ya no existe en el catálogo.")
                                 stock_actual = float(p_row[0] or 0)
                                 costo_actual = float(p_row[1] or 0)
-                                nuevo_stock = stock_actual + cant_unidades
-                                nuevo_costo_prom = round(((stock_actual * costo_actual) + subtotal) / nuevo_stock, 2) if nuevo_stock > 0 else round(subtotal / cant_unidades, 2)
-                                c.execute("UPDATE productos SET existencia = %s, costo_promedio = %s WHERE id = %s",
-                                          (nuevo_stock, nuevo_costo_prom, prod_sel_id))
+                                nuevo_stock = stock_actual + lin["cant"]
+                                nuevo_costo_prom = round(((stock_actual * costo_actual) + costo_lin) / nuevo_stock, 2) if nuevo_stock > 0 else round(costo_lin / lin["cant"], 2)
+                                c.execute("UPDATE productos SET existencia = %s, costo_promedio = %s WHERE id = %s", (nuevo_stock, nuevo_costo_prom, lin["pid"]))
+                                if st.session_state.get("schema_items"):
+                                    c.execute("""INSERT INTO factura_items (id, factura_id, empresa_id, producto_id, descripcion, cantidad, costo_total, created_at)
+                                                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                                              (f"fi-{uuid.uuid4().hex[:12]}", fac_id, str(selected_emp_id), str(lin["pid"]), lin["label"], float(lin["cant"]), float(costo_lin), now_str))
+                                n_lineas_guardadas += 1
 
                         # Asiento contable en la misma transacción
                         cod_d, nom_d = cuenta_debe.split(" - ", 1) if " - " in cuenta_debe else (cuenta_debe, cuenta_debe)
                         cod_h, nom_h = cuenta_haber.split(" - ", 1) if " - " in cuenta_haber else (cuenta_haber, cuenta_haber)
+                        cod_i, nom_i = cuenta_idp.split(" - ", 1) if " - " in cuenta_idp else (cuenta_idp, cuenta_idp)
                         registrar_partida_compra(c, selected_emp_id, fecha_fac, cod_d, nom_d, cod_h, nom_h,
-                                                 subtotal, iva, m_isr, m_iva, liq, num_fac.strip(), prov_nombre.strip(), now_str)
+                                                 subtotal, iva, m_isr, m_iva, liq, num_fac.strip(), prov_nombre.strip(), now_str,
+                                                 idp=monto_idp, cod_idp=cod_i, nom_idp=nom_i)
 
                         conn.commit()
                         conn.close()
                         st.session_state.c_nonce += 1
-                        st.session_state.c_flash = "✅ Factura registrada y asentada en el Libro Diario" + (" · Kárdex actualizado." if (es_inventario and prod_sel_id) else ".")
+                        st.session_state.c_lineas = []
+                        st.session_state.c_line_nonce += 1
+                        st.session_state.pop("c_prod_sel", None)
+                        st.session_state.c_flash = ("✅ Factura registrada y asentada en el Libro Diario"
+                                                    + (f" · Kárdex actualizado ({n_lineas_guardadas} línea(s))" if n_lineas_guardadas else "")
+                                                    + (f" · IDP Q{monto_idp:,.2f} registrado." if monto_idp > 0 else "."))
                         st.rerun()
                     except Exception as err:
                         try:
@@ -1072,10 +1332,11 @@ elif selected_menu in ["🛒 Factura de Compras", "🛒 Compras y Gastos"]:
                         st.error(f"❌ Error al guardar la factura (no se guardó nada): {err}")
 
     with t_fc_hist:
+        col_idp_sql = ', COALESCE(idp, 0) AS "IDP (Q)"' if st.session_state.get("schema_idp") else ""
         conn = get_db_connection()
-        df_c_hist = pd.read_sql_query("""
+        df_c_hist = pd.read_sql_query(f"""
             SELECT id, fecha AS "Fecha", serie AS "Serie", numero_factura AS "No. Factura",
-                   tercero_nombre AS "Proveedor", subtotal AS "Base (Q)", iva AS "IVA (Q)",
+                   tercero_nombre AS "Proveedor", subtotal AS "Base (Q)", iva AS "IVA (Q)"{col_idp_sql},
                    total AS "Total (Q)", monto_ret_isr AS "Ret. ISR (Q)", monto_ret_iva AS "Ret. IVA (Q)",
                    total_a_pagar_cobrar AS "Líquido (Q)",
                    forma_pago AS "Forma Pago", estado_pago AS "Estado"
@@ -1088,7 +1349,7 @@ elif selected_menu in ["🛒 Factura de Compras", "🛒 Compras y Gastos"]:
             st.dataframe(df_c_hist.drop(columns=["id"]), use_container_width=True)
             if is_admin:
                 with st.expander("🗑️ Eliminar Factura de Compra (Solo Administrador)"):
-                    st.caption("Elimina la factura y su partida del Libro Diario. No revierte las existencias del Kárdex.")
+                    st.caption("Elimina la factura y su partida del Libro Diario. Si la compra se registró con líneas de inventario, también revierte las existencias del Kárdex.")
                     del_c_id = st.selectbox("Seleccionar factura a eliminar:", df_c_hist['id'].tolist(),
                                             format_func=lambda x: f"Fac {df_c_hist[df_c_hist['id']==x]['No. Factura'].values[0]} - {df_c_hist[df_c_hist['id']==x]['Proveedor'].values[0]}")
                     if st.button("Confirmar Eliminación Definitiva Compra", type="secondary"):
@@ -1099,8 +1360,20 @@ elif selected_menu in ["🛒 Factura de Compras", "🛒 Compras y Gastos"]:
                         if row_f:
                             glosa_c = f"Factura Compra {row_f[0]} de {row_f[1]}"
                             glosa_ab = f"Abono Factura {row_f[0]} a {row_f[1]}"
-                            c.execute("DELETE FROM libro_diario WHERE empresa_id = %s AND referencia_id = %s AND concepto IN (%s, %s)",
-                                      (str(selected_emp_id), str(row_f[0]), glosa_c, glosa_ab))
+                            c.execute("DELETE FROM libro_diario WHERE empresa_id = %s AND referencia_id = %s AND concepto IN (%s, %s, %s)",
+                                      (str(selected_emp_id), str(row_f[0]), glosa_c, f"{glosa_c} (IDP)", glosa_ab))
+                        # Revertir existencias de las líneas de inventario de esta compra
+                        if st.session_state.get("schema_items"):
+                            c.execute("SELECT producto_id, cantidad, costo_total FROM factura_items WHERE factura_id = %s AND empresa_id = %s", (del_c_id, str(selected_emp_id)))
+                            for pid_i, cant_i, costo_i in c.fetchall():
+                                c.execute("SELECT existencia, costo_promedio FROM productos WHERE id = %s", (pid_i,))
+                                pr = c.fetchone()
+                                if pr:
+                                    ex_a, co_a = float(pr[0] or 0), float(pr[1] or 0)
+                                    ex_n = max(ex_a - float(cant_i or 0), 0.0)
+                                    co_n = round(max((ex_a * co_a - float(costo_i or 0)) / ex_n, 0.0), 2) if ex_n > 0 else co_a
+                                    c.execute("UPDATE productos SET existencia = %s, costo_promedio = %s WHERE id = %s", (ex_n, co_n, pid_i))
+                            c.execute("DELETE FROM factura_items WHERE factura_id = %s AND empresa_id = %s", (del_c_id, str(selected_emp_id)))
                         c.execute("DELETE FROM facturas WHERE id = %s AND empresa_id = %s", (del_c_id, str(selected_emp_id)))
                         conn.commit()
                         conn.close()
@@ -2049,11 +2322,12 @@ elif selected_menu == "📦 Control de Inventarios (Kárdex)":
 elif selected_menu == "📋 Libro de Compras (SAT)":
     if not selected_emp_id: st.stop()
     st.title(f"📋 Libro de Compras Tributario — {selected_empresa_info[1]}")
+    col_idp_libro = ', COALESCE(idp, 0) AS "IDP (Q)"' if st.session_state.get("schema_idp") else ""
     conn = get_db_connection()
-    df_c_sat = pd.read_sql_query("""
+    df_c_sat = pd.read_sql_query(f"""
         SELECT fecha AS "Fecha", serie AS "Serie", numero_factura AS "No. Factura",
                tercero_nit AS "NIT Proveedor", tercero_nombre AS "Proveedor",
-               subtotal AS "Base Imponible (Q)", iva AS "Crédito Fiscal (Q)",
+               subtotal AS "Base Imponible (Q)", iva AS "Crédito Fiscal (Q)"{col_idp_libro},
                monto_ret_isr AS "Ret. ISR (Q)", total AS "Total (Q)"
         FROM facturas WHERE empresa_id = %s AND tipo = 'COMPRA'
         ORDER BY fecha ASC
