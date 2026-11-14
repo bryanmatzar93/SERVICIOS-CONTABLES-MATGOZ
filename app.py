@@ -551,20 +551,33 @@ def registrar_partida_compra(c, empresa_id, fecha, cod_d, nom_d, cod_h, nom_h, s
 # INVENTARIO RÁPIDO DESDE COMPRAS
 # ==========================================
 def asegurar_esquema():
-    """Agrega (una sola vez) la columna IDP y la tabla de líneas de inventario. No altera datos existentes."""
+    """Prepara (solo si falta) la columna IDP y la tabla de líneas de inventario.
+    Primero consulta si ya existen para NO pedir bloqueos sobre 'facturas' en cada sesión,
+    y usa un tiempo máximo de espera para que la app nunca se quede colgada."""
     if "schema_idp" in st.session_state and "schema_items" in st.session_state:
         return
-    for flag, sql in (
-        ("schema_idp", "ALTER TABLE facturas ADD COLUMN IF NOT EXISTS idp NUMERIC DEFAULT 0"),
-        ("schema_items", """CREATE TABLE IF NOT EXISTS factura_items (
+
+    pasos = (
+        ("schema_idp",
+         "SELECT 1 FROM information_schema.columns WHERE table_name = 'facturas' AND column_name = 'idp'",
+         "ALTER TABLE facturas ADD COLUMN IF NOT EXISTS idp NUMERIC DEFAULT 0"),
+        ("schema_items",
+         "SELECT to_regclass('factura_items')",
+         """CREATE TABLE IF NOT EXISTS factura_items (
                 id TEXT PRIMARY KEY, factura_id TEXT NOT NULL, empresa_id TEXT NOT NULL, producto_id TEXT,
                 descripcion TEXT, cantidad NUMERIC DEFAULT 0, costo_total NUMERIC DEFAULT 0, created_at TEXT)"""),
-    ):
+    )
+    for flag, sql_existe, sql_crear in pasos:
         conn = None
         try:
             conn = get_db_connection()
             cur = conn.cursor()
-            cur.execute(sql)
+            cur.execute("SET LOCAL lock_timeout = '3s'")
+            cur.execute(sql_existe)
+            fila = cur.fetchone()
+            existe = bool(fila and fila[0])
+            if not existe:
+                cur.execute(sql_crear)
             conn.commit()
             conn.close()
             st.session_state[flag] = True
