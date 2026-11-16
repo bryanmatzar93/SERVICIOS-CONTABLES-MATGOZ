@@ -520,15 +520,18 @@ def listar_proveedores(empresa_id):
     return base.sort_values("nombre").reset_index(drop=True)
 
 def registrar_partida_compra(c, empresa_id, fecha, cod_d, nom_d, cod_h, nom_h, sub, iva, m_isr, m_iva, liq, num_fac, prov_nombre, now_str,
-                             factura_id=None, idp=0.0, cod_idp=None, nom_idp=None):
+                             factura_id=None, idp=0.0, cod_idp=None, nom_idp=None, partida_no=None):
     """Asienta la compra en el Libro Diario usando el mismo cursor/transacción de la factura (incluye IDP si existe)."""
     idp = float(idp or 0.0)
     debe_total = round(float(sub) + float(iva) + idp, 2)
     haber_total = round(float(m_isr) + float(m_iva) + float(liq), 2)
     if abs(debe_total - haber_total) > 0.01:
         raise ValueError(f"La partida no cuadra: Debe Q{debe_total:,.2f} vs Haber Q{haber_total:,.2f}")
-    c.execute("SELECT COALESCE(MAX(partida_no), 0) + 1 FROM libro_diario WHERE empresa_id = %s", (str(empresa_id),))
-    p_no = int(c.fetchone()[0])
+    if partida_no is None:
+        c.execute("SELECT COALESCE(MAX(partida_no), 0) + 1 FROM libro_diario WHERE empresa_id = %s", (str(empresa_id),))
+        p_no = int(c.fetchone()[0])
+    else:
+        p_no = int(partida_no)
     glosa = f"Factura Compra {num_fac} de {prov_nombre}"
     q_ld = """
         INSERT INTO libro_diario (empresa_id, partida_no, fecha, codigo_cuenta, nombre_cuenta, debe, haber, concepto, referencia_id, created_at)
@@ -652,6 +655,163 @@ def crear_producto_db(empresa_id, codigo, descripcion, precio_venta=0.0):
         except Exception:
             pass
         return None, str(e)
+
+def aplicar_linea_kardex(c, pid, cant, costo):
+    """Suma existencias y recalcula el costo promedio ponderado de un producto."""
+    c.execute("SELECT existencia, costo_promedio FROM productos WHERE id = %s", (pid,))
+    r = c.fetchone()
+    if not r:
+        raise ValueError("Un producto de la compra ya no existe en el catálogo del Kárdex.")
+    ex, co = float(r[0] or 0), float(r[1] or 0)
+    cant, costo = float(cant or 0), float(costo or 0)
+    nuevo = ex + cant
+    if nuevo > 0:
+        cp = round(((ex * co) + costo) / nuevo, 2)
+    else:
+        cp = round(costo / cant, 2) if cant else co
+    c.execute("UPDATE productos SET existencia = %s, costo_promedio = %s WHERE id = %s", (nuevo, cp, pid))
+
+def revertir_linea_kardex(c, pid, cant, costo):
+    """Descuenta existencias de una línea y recalcula el costo promedio (inverso de aplicar_linea_kardex)."""
+    c.execute("SELECT existencia, costo_promedio FROM productos WHERE id = %s", (pid,))
+    r = c.fetchone()
+    if not r:
+        return
+    ex, co = float(r[0] or 0), float(r[1] or 0)
+    ex_n = max(ex - float(cant or 0), 0.0)
+    co_n = round(max((ex * co - float(costo or 0)) / ex_n, 0.0), 2) if ex_n > 0 else co
+    c.execute("UPDATE productos SET existencia = %s, costo_promedio = %s WHERE id = %s", (ex_n, co_n, pid))
+
+def leer_factura(factura_id, empresa_id):
+    conn = None
+    try:
+        conn = get_db_connection()
+        df = pd.read_sql_query("SELECT * FROM facturas WHERE id = %s AND empresa_id = %s", conn, params=(factura_id, str(empresa_id)))
+        conn.close()
+        return df.iloc[0] if not df.empty else None
+    except Exception:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+        return None
+
+def leer_items_factura(factura_id, empresa_id):
+    cols = ["id", "producto_id", "descripcion", "cantidad", "costo_total"]
+    conn = None
+    try:
+        conn = get_db_connection()
+        df = pd.read_sql_query(
+            "SELECT id, producto_id, descripcion, cantidad, costo_total FROM factura_items WHERE factura_id = %s AND empresa_id = %s ORDER BY created_at",
+            conn, params=(factura_id, str(empresa_id)))
+        conn.close()
+        for k in ("cantidad", "costo_total"):
+            df[k] = pd.to_numeric(df[k], errors="coerce").fillna(0.0)
+        return df
+    except Exception:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+        return pd.DataFrame(columns=cols)
+
+def ui_lineas_kardex(pfx, key_lineas, key_nonce, key_sel, productos_bd, empresa_id):
+    """Interfaz reutilizable: buscar producto, crearlo si no existe y agregar líneas (producto, cantidad, total)."""
+    if key_lineas not in st.session_state:
+        st.session_state[key_lineas] = []
+    if key_nonce not in st.session_state:
+        st.session_state[key_nonce] = 0
+    ln = st.session_state[key_nonce]
+    lineas = st.session_state[key_lineas]
+
+    st.markdown("#### 📦 Productos que ingresan al Kárdex")
+    st.caption("Agrega una línea por cada producto de la factura. Puedes agregar todas las que necesites.")
+
+    buscar_prod = st.text_input("🔎 Buscar producto (nombre o código)", key=f"{pfx}_busq_{ln}", placeholder="Escribe parte del nombre...")
+    q_busq = buscar_prod.strip()
+    if q_busq and not productos_bd.empty:
+        patron_b = re.escape(q_busq)
+        df_filtrado = productos_bd[productos_bd["descripcion"].astype(str).str.contains(patron_b, case=False, na=False)
+                                   | productos_bd["codigo"].astype(str).str.contains(patron_b, case=False, na=False)]
+    else:
+        df_filtrado = productos_bd
+
+    dict_prods = {f"[{r['codigo']}] {r['descripcion']} (Stock: {r['existencia']})": r['id'] for _, r in df_filtrado.iterrows()}
+    etiquetas_prod = list(dict_prods.keys())
+    SENT_PROD = "-- Seleccionar Producto --"
+    opciones_k = [SENT_PROD] + etiquetas_prod
+
+    idx_prod = 0
+    prod_pre = st.session_state.get(key_sel)
+    if prod_pre is not None:
+        for i_k, lbl_k in enumerate(etiquetas_prod, start=1):
+            if str(dict_prods[lbl_k]) == str(prod_pre):
+                idx_prod = i_k
+                break
+    elif q_busq and len(etiquetas_prod) == 1:
+        idx_prod = 1
+
+    if q_busq and not etiquetas_prod:
+        st.warning(f"No hay productos que coincidan con «{q_busq}». Créalo aquí abajo en «Crear producto nuevo».")
+
+    qsig = hashlib.md5(q_busq.encode()).hexdigest()[:6]
+    sel_p = st.selectbox("Producto:", opciones_k, index=idx_prod, key=f"{pfx}_prod_k_{ln}_{qsig}_{len(etiquetas_prod)}")
+
+    with st.expander("➕ ¿El producto no existe? Créalo aquí mismo (se agrega al Kárdex)"):
+        np1, np2, np3 = st.columns([1, 3, 1.5])
+        np_cod = np1.text_input("Código", value=siguiente_codigo_producto(productos_bd), key=f"{pfx}_np_cod_{ln}")
+        np_desc = np2.text_input("Descripción *", value=q_busq, key=f"{pfx}_np_desc_{ln}_{qsig}")
+        np_prec = np3.number_input("Precio venta Q (opcional)", min_value=0.0, step=10.0, format="%.2f", key=f"{pfx}_np_prec_{ln}")
+        if st.button("💾 Crear producto y seleccionarlo", key=f"{pfx}_np_btn_{ln}"):
+            if not np_desc.strip() or not np_cod.strip():
+                st.error("Código y descripción son obligatorios.")
+            else:
+                nuevo_id, err_np = crear_producto_db(empresa_id, np_cod.strip(), np_desc.strip(), np_prec)
+                if err_np:
+                    st.error(f"❌ {err_np}")
+                else:
+                    st.session_state[key_sel] = nuevo_id
+                    st.session_state[key_nonce] += 1
+                    st.session_state[f"{pfx}_flash_prod"] = f"✅ Producto «{np_desc.strip()}» creado. Ya está seleccionado: indica cantidad y total de la línea."
+                    st.rerun()
+
+    if st.session_state.get(f"{pfx}_flash_prod"):
+        st.success(st.session_state.pop(f"{pfx}_flash_prod"))
+
+    l1, l2, l3 = st.columns([1.2, 1.6, 1])
+    cant_linea = l1.number_input("Cantidad *", min_value=0.0, step=1.0, value=1.0, format="%.2f", key=f"{pfx}_lcant_{ln}")
+    total_linea = l2.number_input("Total de la línea Q (como aparece en la factura)", min_value=0.0, step=10.0, format="%.2f", key=f"{pfx}_ltot_{ln}",
+                                  help="Déjalo en 0 si hay un solo producto: se asigna toda la base disponible.")
+    l3.markdown("&nbsp;", unsafe_allow_html=True)
+    if l3.button("➕ Agregar línea", key=f"{pfx}_ladd_{ln}"):
+        if sel_p == SENT_PROD:
+            st.error("Selecciona un producto (o créalo) antes de agregar la línea.")
+        elif cant_linea <= 0:
+            st.error("La cantidad debe ser mayor a 0.")
+        else:
+            st.session_state[key_lineas].append({
+                "pid": dict_prods[sel_p], "label": sel_p.split(" (Stock:")[0],
+                "cant": float(cant_linea), "total": float(total_linea)
+            })
+            st.session_state.pop(key_sel, None)
+            st.session_state[key_nonce] += 1
+            st.rerun()
+
+    if lineas:
+        st.markdown("**Líneas agregadas:**")
+        for i_l, lin in enumerate(lineas):
+            cl = st.columns([4, 1.3, 1.6, 0.8])
+            cl[0].write(f"{i_l + 1}. {lin['label']}")
+            cl[1].write(f"Cant: {lin['cant']:,.2f}")
+            cl[2].write(f"Q {lin['total']:,.2f}" if lin['total'] > 0 else "Total: base disponible")
+            if cl[3].button("❌", key=f"{pfx}_ldel_{i_l}_{ln}"):
+                st.session_state[key_lineas].pop(i_l)
+                st.rerun()
+    else:
+        st.info("Aún no hay líneas agregadas.")
+    return st.session_state[key_lineas]
 
 # ==========================================
 # EXPORTACIÓN PDF FISCAL Y REPORTES
@@ -1015,98 +1175,7 @@ elif selected_menu in ["🛒 Factura de Compras", "🛒 Compras y Gastos"]:
 
                 if destino_bien == "Mercadería para Inventario (Kárdex)":
                     es_inventario = True
-                    ln = st.session_state.c_line_nonce
-
-                    st.markdown("#### 📦 Productos que ingresan al Kárdex")
-                    st.caption("Agrega una línea por cada producto de la factura. Puedes agregar todas las que necesites.")
-
-                    # ---- Buscador de producto ----
-                    buscar_prod = st.text_input("🔎 Buscar producto (nombre o código)", key=f"fc_busq_{ln}", placeholder="Escribe parte del nombre...")
-                    q_busq = buscar_prod.strip()
-                    if q_busq and not productos_bd.empty:
-                        patron_b = re.escape(q_busq)
-                        df_filtrado = productos_bd[productos_bd["descripcion"].astype(str).str.contains(patron_b, case=False, na=False)
-                                                   | productos_bd["codigo"].astype(str).str.contains(patron_b, case=False, na=False)]
-                    else:
-                        df_filtrado = productos_bd
-
-                    dict_prods = {f"[{r['codigo']}] {r['descripcion']} (Stock: {r['existencia']})": r['id'] for _, r in df_filtrado.iterrows()}
-                    etiquetas_prod = list(dict_prods.keys())
-                    SENT_PROD = "-- Seleccionar Producto --"
-                    opciones_k = [SENT_PROD] + etiquetas_prod
-
-                    # Selección automática: producto recién creado o única coincidencia de la búsqueda
-                    idx_prod = 0
-                    prod_pre = st.session_state.get("c_prod_sel")
-                    if prod_pre is not None:
-                        for i_k, lbl_k in enumerate(etiquetas_prod, start=1):
-                            if str(dict_prods[lbl_k]) == str(prod_pre):
-                                idx_prod = i_k
-                                break
-                    elif q_busq and len(etiquetas_prod) == 1:
-                        idx_prod = 1
-
-                    if q_busq and not etiquetas_prod:
-                        st.warning(f"No hay productos que coincidan con «{q_busq}». Créalo aquí abajo en «Crear producto nuevo».")
-
-                    qsig = hashlib.md5(q_busq.encode()).hexdigest()[:6]
-                    sel_p = st.selectbox("Producto:", opciones_k, index=idx_prod, key=f"fc_prod_k_{ln}_{qsig}_{len(etiquetas_prod)}")
-
-                    # ---- Crear producto nuevo sin salir del módulo ----
-                    with st.expander("➕ ¿El producto no existe? Créalo aquí mismo (se agrega al Kárdex)"):
-                        np1, np2, np3 = st.columns([1, 3, 1.5])
-                        np_cod = np1.text_input("Código", value=siguiente_codigo_producto(productos_bd), key=f"fc_np_cod_{ln}")
-                        np_desc = np2.text_input("Descripción *", value=q_busq, key=f"fc_np_desc_{ln}_{qsig}")
-                        np_prec = np3.number_input("Precio venta Q (opcional)", min_value=0.0, step=10.0, format="%.2f", key=f"fc_np_prec_{ln}")
-                        if st.button("💾 Crear producto y seleccionarlo", key=f"fc_np_btn_{ln}"):
-                            if not np_desc.strip() or not np_cod.strip():
-                                st.error("Código y descripción son obligatorios.")
-                            else:
-                                nuevo_id, err_np = crear_producto_db(selected_emp_id, np_cod.strip(), np_desc.strip(), np_prec)
-                                if err_np:
-                                    st.error(f"❌ {err_np}")
-                                else:
-                                    st.session_state["c_prod_sel"] = nuevo_id
-                                    st.session_state.c_line_nonce += 1
-                                    st.session_state["c_flash_prod"] = f"✅ Producto «{np_desc.strip()}» creado. Ya está seleccionado: indica cantidad y total de la línea."
-                                    st.rerun()
-
-                    if st.session_state.get("c_flash_prod"):
-                        st.success(st.session_state.pop("c_flash_prod"))
-
-                    # ---- Cantidad, total de la línea y botón agregar ----
-                    l1, l2, l3 = st.columns([1.2, 1.6, 1])
-                    cant_linea = l1.number_input("Cantidad *", min_value=0.0, step=1.0, value=1.0, format="%.2f", key=f"fc_lcant_{ln}")
-                    total_linea = l2.number_input("Total de la línea Q (como aparece en la factura)", min_value=0.0, step=10.0, format="%.2f", key=f"fc_ltot_{ln}",
-                                                  help="Déjalo en 0 si la factura tiene un solo producto: se asigna toda la base de la factura.")
-                    l3.markdown("&nbsp;", unsafe_allow_html=True)
-                    if l3.button("➕ Agregar línea", key=f"fc_ladd_{ln}"):
-                        if sel_p == SENT_PROD:
-                            st.error("Selecciona un producto (o créalo) antes de agregar la línea.")
-                        elif cant_linea <= 0:
-                            st.error("La cantidad debe ser mayor a 0.")
-                        else:
-                            st.session_state.c_lineas.append({
-                                "pid": dict_prods[sel_p], "label": sel_p.split(" (Stock:")[0],
-                                "cant": float(cant_linea), "total": float(total_linea)
-                            })
-                            st.session_state.pop("c_prod_sel", None)
-                            st.session_state.c_line_nonce += 1
-                            st.rerun()
-
-                    # ---- Líneas agregadas ----
-                    if lineas:
-                        st.markdown("**Líneas agregadas a esta factura:**")
-                        for i_l, lin in enumerate(lineas):
-                            cl = st.columns([4, 1.3, 1.6, 0.8])
-                            cl[0].write(f"{i_l + 1}. {lin['label']}")
-                            cl[1].write(f"Cant: {lin['cant']:,.2f}")
-                            cl[2].write(f"Q {lin['total']:,.2f}" if lin['total'] > 0 else "Total: base de la factura")
-                            if cl[3].button("❌", key=f"fc_ldel_{i_l}_{ln}"):
-                                st.session_state.c_lineas.pop(i_l)
-                                st.rerun()
-                    else:
-                        st.info("Aún no hay líneas. Agrega al menos un producto para que se actualice el Kárdex.")
+                    lineas = ui_lineas_kardex("fc", "c_lineas", "c_line_nonce", "c_prod_sel", productos_bd, selected_emp_id)
 
             st.markdown("---")
             col_fp1, col_fp2 = st.columns(2)
@@ -1360,6 +1429,273 @@ elif selected_menu in ["🛒 Factura de Compras", "🛒 Compras y Gastos"]:
 
         if not df_c_hist.empty:
             st.dataframe(df_c_hist.drop(columns=["id"]), use_container_width=True)
+
+            st.markdown("---")
+            t_h_edit, t_h_kardex = st.tabs(["✏️ Editar compra", "📦 Ajustar Kárdex de una compra"])
+
+            def _etq_compra(x):
+                f_ = df_c_hist[df_c_hist['id'] == x].iloc[0]
+                return f"{f_['Fecha']} · Fac {f_['No. Factura']} · {f_['Proveedor']} · Q{float(f_['Total (Q)']):,.2f}"
+
+            # ---------------------------------------------------------------- EDITAR
+            with t_h_edit:
+                if st.session_state.get("ce_flash"):
+                    st.success(st.session_state.pop("ce_flash"))
+                sel_edit = st.selectbox("Selecciona la compra a editar:", df_c_hist['id'].tolist(), format_func=_etq_compra, key="ce_sel")
+                row_ce = leer_factura(sel_edit, selected_emp_id)
+                if row_ce is None:
+                    st.error("No se encontró la factura seleccionada.")
+                else:
+                    kx = str(sel_edit)   # las claves llevan el id para que cada factura muestre SUS datos
+                    sub_old, iva_old, tot_old = num_seguro(row_ce.get("subtotal")), num_seguro(row_ce.get("iva")), num_seguro(row_ce.get("total"))
+                    idp_old = num_seguro(row_ce.get("idp"))
+                    t_isr_old, m_isr_old = num_seguro(row_ce.get("tasa_ret_isr")), num_seguro(row_ce.get("monto_ret_isr"))
+                    t_iva_old, m_iva_old = num_seguro(row_ce.get("tasa_ret_iva")), num_seguro(row_ce.get("monto_ret_iva"))
+                    liq_old, saldo_old = num_seguro(row_ce.get("total_a_pagar_cobrar")), num_seguro(row_ce.get("saldo_pendiente"))
+                    estado_old = str(row_ce.get("estado_pago") or "")
+                    num_old, prov_old = str(row_ce.get("numero_factura") or ""), str(row_ce.get("tercero_nombre") or "")
+
+                    op_isr = ["No Aplica", "5% General", "7% Excedente (Sobre Q30k)", "10% Servicios Técnicos/Honorarios"]
+                    op_iva = ["No Aplica / No es Agente Retenedor", "15% Retención IVA (Decreto 20-2006)", "25% Exportadores", "100% Retención Total IVA"]
+                    idx_isr = 0
+                    if m_isr_old > 0:
+                        idx_isr = 3 if abs(t_isr_old - 0.10) < 1e-4 else (2 if abs(t_isr_old - 0.07) < 1e-4 else 1)
+                    idx_iva = 0
+                    if m_iva_old > 0:
+                        idx_iva = 3 if t_iva_old >= 0.99 else (2 if abs(t_iva_old - 0.25) < 1e-4 else 1)
+
+                    try:
+                        f_ce = datetime.strptime(str(row_ce.get("fecha"))[:10], "%Y-%m-%d").date()
+                    except Exception:
+                        f_ce = hoy_gt()
+                    e1, e2, e3 = st.columns(3)
+                    ce_fecha = e1.date_input("Fecha de emisión", value=f_ce, key=f"ce_fec_{kx}")
+                    ce_num = e2.text_input("Número factura / documento *", value=num_old, key=f"ce_num_{kx}")
+                    ce_serie = e3.text_input("Serie", value=str(row_ce.get("serie") or ""), key=f"ce_ser_{kx}")
+                    e4, e5 = st.columns(2)
+                    ce_prov = e4.text_input("Proveedor *", value=prov_old, key=f"ce_prv_{kx}")
+                    ce_nit = e5.text_input("NIT del proveedor *", value=str(row_ce.get("tercero_nit") or ""), key=f"ce_nit_{kx}")
+
+                    cd_old, ch_old = str(row_ce.get("cuenta_nomenclatura") or ""), str(row_ce.get("cuenta_pago") or "")
+                    lista_d = ([cd_old] if cd_old and cd_old not in lista_cuentas_debe else []) + lista_cuentas_debe
+                    base_h = opciones_haber if opciones_haber else ["2.1.01.01 - Proveedores / Cuentas por Pagar"]
+                    lista_h = ([ch_old] if ch_old and ch_old not in base_h else []) + base_h
+                    e6, e7 = st.columns(2)
+                    ce_cdebe = e6.selectbox("Cuenta de cargo / DEBE", lista_d, index=lista_d.index(cd_old) if cd_old in lista_d else 0, key=f"ce_cdebe_{kx}")
+                    ce_chaber = e7.selectbox("Cuenta de abono / HABER", lista_h, index=lista_h.index(ch_old) if ch_old in lista_h else 0, key=f"ce_chaber_{kx}")
+
+                    ce_tot = float(st.number_input("Total facturado Q *", min_value=0.0, step=50.0, format="%.2f", value=tot_old, key=f"ce_tot_{kx}"))
+                    ce_sin_iva = st.checkbox("Sin IVA (Pequeño Contribuyente o documento no fiscal)", value=(iva_old == 0), key=f"ce_siniva_{kx}")
+
+                    con_col_idp = bool(st.session_state.get("schema_idp"))
+                    ce_idp, ce_cidp = 0.0, ce_cdebe
+                    if con_col_idp:
+                        if st.checkbox("⛽ La factura incluye IDP", value=idp_old > 0, key=f"ce_idpchk_{kx}"):
+                            i1, i2 = st.columns(2)
+                            ce_idp = float(i1.number_input("Monto de IDP Q", min_value=0.0, step=1.0, format="%.2f", value=idp_old, key=f"ce_idp_{kx}"))
+                            ce_cidp = i2.selectbox("Cuenta contable del IDP", lista_d, index=lista_d.index(ce_cdebe) if ce_cdebe in lista_d else 0, key=f"ce_cidp_{kx}")
+                    elif idp_old > 0:
+                        st.caption(f"Esta factura tiene IDP de Q {idp_old:,.2f}.")
+                    if ce_idp >= ce_tot > 0:
+                        st.error("El IDP no puede ser igual o mayor al total facturado.")
+                        ce_idp = 0.0
+
+                    r1, r2 = st.columns(2)
+                    ce_tisr = r1.selectbox("Retención ISR practicada", op_isr, index=idx_isr, key=f"ce_tisr_{kx}")
+                    ce_tiva = r2.selectbox("Retención IVA practicada", op_iva, index=idx_iva, key=f"ce_tiva_{kx}")
+
+                    base_ce = max(ce_tot - ce_idp, 0.0)
+                    if abs(ce_tot - tot_old) < 0.005 and abs(ce_idp - idp_old) < 0.005 and ce_sin_iva == (iva_old == 0):
+                        sub_ce, iva_ce = sub_old, iva_old            # sin cambios en importes: se conserva el desglose original
+                    elif ce_sin_iva:
+                        sub_ce, iva_ce = round(base_ce, 2), 0.0
+                    else:
+                        sub_ce = round(base_ce / 1.12, 2)
+                        iva_ce = round(base_ce - sub_ce, 2)
+                    ret_ce = calcular_retenciones(ce_tot, sub_ce, iva_ce, ce_tisr != "No Aplica", ce_tisr, "No Aplica" not in ce_tiva, ce_tiva)
+                    liq_ce = ret_ce["liq"]
+                    st.info(f"Subtotal: Q{sub_ce:,.2f} | IVA: Q{iva_ce:,.2f} | IDP: Q{ce_idp:,.2f} | **Total:** Q{ce_tot:,.2f} | Ret. ISR: Q{ret_ce['m_isr']:,.2f} | Ret. IVA: Q{ret_ce['m_iva']:,.2f} | **Líquido:** Q{liq_ce:,.2f}")
+                    st.caption(f"Condición de pago (no editable): {row_ce.get('forma_pago')} · Estado: {estado_old} · Saldo pendiente actual: Q {saldo_old:,.2f}. Los pagos ya registrados se conservan.")
+
+                    if st.button("💾 Guardar cambios de la compra", type="primary", key=f"ce_save_{kx}"):
+                        if not (ce_num.strip() and ce_prov.strip() and ce_nit.strip()) or ce_tot <= 0:
+                            st.error("Número, proveedor, NIT y un total mayor a 0 son obligatorios.")
+                        else:
+                            conn = None
+                            try:
+                                conn = get_db_connection()
+                                c = conn.cursor()
+                                now_ce = datetime.now().isoformat()
+                                emp = str(selected_emp_id)
+
+                                # Saldo / estado: se conserva lo ya pagado
+                                if estado_old == "PENDIENTE":
+                                    pagado = max(round(liq_old - saldo_old, 2), 0.0)
+                                    nuevo_saldo = round(max(liq_ce - pagado, 0.0), 2)
+                                    nuevo_estado = "PENDIENTE" if nuevo_saldo > 0 else "PAGADO"
+                                else:
+                                    nuevo_saldo, nuevo_estado = saldo_old, estado_old
+
+                                sets = ["fecha = %s", "numero_factura = %s", "serie = %s", "tercero_nombre = %s", "tercero_nit = %s",
+                                        "subtotal = %s", "iva = %s", "total = %s",
+                                        "aplica_ret_isr = %s", "tasa_ret_isr = %s", "monto_ret_isr = %s",
+                                        "aplica_ret_iva = %s", "tasa_ret_iva = %s", "monto_ret_iva = %s",
+                                        "total_a_pagar_cobrar = %s", "saldo_pendiente = %s", "estado_pago = %s",
+                                        "cuenta_nomenclatura = %s", "cuenta_pago = %s"]
+                                vals = [str(ce_fecha), ce_num.strip(), ce_serie.strip(), ce_prov.strip(), ce_nit.strip().upper(),
+                                        float(sub_ce), float(iva_ce), float(ce_tot),
+                                        1 if ret_ce["m_isr"] > 0 else 0, float(ret_ce["t_isr"]), float(ret_ce["m_isr"]),
+                                        1 if ret_ce["m_iva"] > 0 else 0, float(ret_ce["t_iva"]), float(ret_ce["m_iva"]),
+                                        float(liq_ce), float(nuevo_saldo), nuevo_estado, ce_cdebe, ce_chaber]
+                                if con_col_idp:
+                                    sets.append("idp = %s")
+                                    vals.append(float(ce_idp))
+                                c.execute(f"UPDATE facturas SET {', '.join(sets)} WHERE id = %s AND empresa_id = %s", tuple(vals + [sel_edit, emp]))
+
+                                # Reemplazar SOLO el asiento de esta compra (se conserva su número de partida y los pagos)
+                                glosa_old = f"Factura Compra {num_old} de {prov_old}"
+                                c.execute("SELECT MIN(partida_no) FROM libro_diario WHERE empresa_id = %s AND referencia_id = %s AND concepto IN (%s, %s)",
+                                          (emp, num_old, glosa_old, f"{glosa_old} (IDP)"))
+                                p_old = c.fetchone()[0]
+                                c.execute("DELETE FROM libro_diario WHERE empresa_id = %s AND referencia_id = %s AND concepto IN (%s, %s)",
+                                          (emp, num_old, glosa_old, f"{glosa_old} (IDP)"))
+                                borradas = c.rowcount
+                                cod_d, nom_d = ce_cdebe.split(" - ", 1) if " - " in ce_cdebe else (ce_cdebe, ce_cdebe)
+                                cod_h, nom_h = ce_chaber.split(" - ", 1) if " - " in ce_chaber else (ce_chaber, ce_chaber)
+                                cod_i, nom_i = ce_cidp.split(" - ", 1) if " - " in ce_cidp else (ce_cidp, ce_cidp)
+                                registrar_partida_compra(c, selected_emp_id, ce_fecha, cod_d, nom_d, cod_h, nom_h, sub_ce, iva_ce,
+                                                         ret_ce["m_isr"], ret_ce["m_iva"], liq_ce, ce_num.strip(), ce_prov.strip(), now_ce,
+                                                         idp=ce_idp, cod_idp=cod_i, nom_idp=nom_i, partida_no=p_old)
+
+                                # Si cambió el número o el proveedor, actualizar también los pagos ya registrados
+                                if ce_num.strip() != num_old or ce_prov.strip() != prov_old:
+                                    c.execute("UPDATE libro_diario SET referencia_id = %s, concepto = %s WHERE empresa_id = %s AND referencia_id = %s AND concepto = %s",
+                                              (ce_num.strip(), f"Abono Factura {ce_num.strip()} a {ce_prov.strip()}", emp, num_old, f"Abono Factura {num_old} a {prov_old}"))
+
+                                # Kárdex: si la base de la compra cambió, se re-reparte el costo de sus líneas
+                                aviso_kardex = ""
+                                if st.session_state.get("schema_items"):
+                                    c.execute("SELECT id, producto_id, cantidad, costo_total FROM factura_items WHERE factura_id = %s AND empresa_id = %s", (sel_edit, emp))
+                                    items_ce = c.fetchall()
+                                    if items_ce:
+                                        costos_old = [float(x[3] or 0) for x in items_ce]
+                                        idp_en_inv = idp_old > 0 and abs(sum(costos_old) - (sub_old + idp_old)) < 0.02
+                                        base_inv_new = round(sub_ce + (ce_idp if idp_en_inv else 0.0), 2)
+                                        if abs(sum(costos_old) - base_inv_new) > 0.005:
+                                            nuevos = repartir_costos(costos_old, base_inv_new)
+                                            for (iid, pid_i, cant_i, co_i), co_new in zip(items_ce, nuevos):
+                                                revertir_linea_kardex(c, pid_i, cant_i, co_i)
+                                                aplicar_linea_kardex(c, pid_i, cant_i, co_new)
+                                                c.execute("UPDATE factura_items SET costo_total = %s WHERE id = %s", (float(co_new), iid))
+                                            aviso_kardex = " · Costo del Kárdex recalculado."
+                                conn.commit()
+                                conn.close()
+                                msg = "✅ Compra actualizada y asiento contable reemplazado" + aviso_kardex
+                                if borradas == 0:
+                                    msg += " · ⚠️ No se encontró el asiento anterior (compra creada con una versión previa): se generó una partida nueva; revisa el Libro Diario por si quedó duplicada."
+                                st.session_state["ce_flash"] = msg
+                                st.rerun()
+                            except Exception as err:
+                                try:
+                                    if conn:
+                                        conn.rollback()
+                                        conn.close()
+                                except Exception:
+                                    pass
+                                st.error(f"❌ No se pudo guardar (no se modificó nada): {err}")
+
+            # ---------------------------------------------------------------- AJUSTAR KÁRDEX
+            with t_h_kardex:
+                if not st.session_state.get("schema_items"):
+                    st.warning("Falta la tabla `factura_items` en la base de datos. Créala con el SQL que te indiqué y recarga la página.")
+                else:
+                    if st.session_state.get("aj_flash"):
+                        st.success(st.session_state.pop("aj_flash"))
+                    st.caption("Úsalo cuando olvidaste agregar una línea de producto al registrar una compra: la agregas aquí y se suma al Kárdex. "
+                               "También puedes quitar líneas mal puestas. Solo se ajusta el Kárdex; el asiento contable no cambia.")
+                    sel_aj = st.selectbox("Selecciona la compra:", df_c_hist['id'].tolist(), format_func=_etq_compra, key="aj_sel")
+                    row_aj = leer_factura(sel_aj, selected_emp_id)
+                    if row_aj is None:
+                        st.error("No se encontró la factura seleccionada.")
+                    else:
+                        kxa = str(sel_aj)
+                        sub_aj, idp_aj = num_seguro(row_aj.get("subtotal")), num_seguro(row_aj.get("idp"))
+                        items_aj = leer_items_factura(sel_aj, selected_emp_id)
+
+                        if items_aj.empty:
+                            st.info("Esta compra no tiene líneas de Kárdex registradas. Las compras hechas antes de esta versión no guardaron sus líneas: agrega aquí solo los productos que NO ingresaron al Kárdex.")
+                            idp_en_inv_aj = bool(idp_aj > 0 and st.checkbox("Incluir el IDP en el costo del inventario", value=False, key=f"aj_idpinv_{kxa}"))
+                        else:
+                            st.markdown("**Líneas registradas en esta compra:**")
+                            st.dataframe(items_aj[["descripcion", "cantidad", "costo_total"]].rename(columns={"descripcion": "Producto", "cantidad": "Cantidad", "costo_total": "Costo Kárdex (Q)"}),
+                                         use_container_width=True)
+                            idp_en_inv_aj = bool(idp_aj > 0 and abs(float(items_aj["costo_total"].sum()) - (sub_aj + idp_aj)) < 0.02)
+
+                        quitar_ids = []
+                        if not items_aj.empty:
+                            quitar_ids = st.multiselect("Quitar líneas de esta compra (se descuentan del Kárdex):", items_aj["id"].tolist(),
+                                                        format_func=lambda x: f"{items_aj[items_aj['id']==x]['descripcion'].values[0]} · {float(items_aj[items_aj['id']==x]['cantidad'].values[0]):,.2f} u · Q{float(items_aj[items_aj['id']==x]['costo_total'].values[0]):,.2f}",
+                                                        key=f"aj_quitar_{kxa}")
+
+                        lineas_aj = ui_lineas_kardex("aj", "aj_lineas", "aj_line_nonce", "aj_prod_sel", leer_productos(), selected_emp_id)
+
+                        base_inv_aj = round(sub_aj + (idp_aj if idp_en_inv_aj else 0.0), 2)
+                        costo_conservado = round(float(items_aj[~items_aj["id"].isin(quitar_ids)]["costo_total"].sum()) if not items_aj.empty else 0.0, 2)
+                        restante = round(base_inv_aj - costo_conservado, 2)
+                        st.info(f"Base de la compra para Kárdex (sin IVA): Q {base_inv_aj:,.2f} · Ya asignada a líneas que se conservan: Q {costo_conservado:,.2f} · **Por asignar a líneas nuevas: Q {restante:,.2f}**")
+
+                        aj_ok, aj_msg, costos_aj = True, "", []
+                        if lineas_aj:
+                            if restante <= 0.005:
+                                aj_ok, aj_msg = False, "No queda costo por asignar en esta compra. Quita primero una línea existente para repartir su costo con las nuevas."
+                            elif len(lineas_aj) > 1 and any(l["total"] <= 0 for l in lineas_aj):
+                                aj_ok, aj_msg = False, "Con más de una línea nueva, cada una debe tener su total (> 0) para repartir el costo."
+                            else:
+                                costos_aj = repartir_costos([l["total"] for l in lineas_aj], restante)
+                                st.markdown("**Costo que ingresará al Kárdex por las líneas nuevas:**")
+                                st.dataframe(pd.DataFrame([{"Producto": l["label"], "Cantidad": l["cant"], "Costo Kárdex (Q)": cst,
+                                                            "Costo unitario (Q)": round(cst / l["cant"], 4) if l["cant"] > 0 else 0.0}
+                                                           for l, cst in zip(lineas_aj, costos_aj)]), use_container_width=True)
+                            if not aj_ok:
+                                st.error(aj_msg)
+
+                        if st.button("✅ Aplicar ajuste al Kárdex", type="primary", key=f"aj_apply_{kxa}"):
+                            if not quitar_ids and not lineas_aj:
+                                st.warning("No hay cambios por aplicar: agrega una línea o selecciona líneas para quitar.")
+                            elif lineas_aj and not aj_ok:
+                                st.error(aj_msg)
+                            else:
+                                conn = None
+                                try:
+                                    conn = get_db_connection()
+                                    c = conn.cursor()
+                                    now_aj = datetime.now().isoformat()
+                                    for iid in quitar_ids:
+                                        fila_q = items_aj[items_aj["id"] == iid].iloc[0]
+                                        revertir_linea_kardex(c, fila_q["producto_id"], fila_q["cantidad"], fila_q["costo_total"])
+                                        c.execute("DELETE FROM factura_items WHERE id = %s AND empresa_id = %s", (iid, str(selected_emp_id)))
+                                    for lin, costo_lin in zip(lineas_aj, costos_aj):
+                                        aplicar_linea_kardex(c, lin["pid"], lin["cant"], costo_lin)
+                                        c.execute("""INSERT INTO factura_items (id, factura_id, empresa_id, producto_id, descripcion, cantidad, costo_total, created_at)
+                                                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                                                  (f"fi-{uuid.uuid4().hex[:12]}", sel_aj, str(selected_emp_id), str(lin["pid"]), lin["label"], float(lin["cant"]), float(costo_lin), now_aj))
+                                    conn.commit()
+                                    conn.close()
+                                    st.session_state["aj_lineas"] = []
+                                    st.session_state["aj_line_nonce"] = st.session_state.get("aj_line_nonce", 0) + 1
+                                    st.session_state.pop("aj_prod_sel", None)
+                                    st.session_state["aj_flash"] = f"✅ Kárdex ajustado: {len(lineas_aj)} línea(s) agregada(s) y {len(quitar_ids)} quitada(s)."
+                                    st.rerun()
+                                except Exception as err:
+                                    try:
+                                        if conn:
+                                            conn.rollback()
+                                            conn.close()
+                                    except Exception:
+                                        pass
+                                    st.error(f"❌ No se pudo ajustar el Kárdex (no se modificó nada): {err}")
+
+
             if is_admin:
                 with st.expander("🗑️ Eliminar Factura de Compra (Solo Administrador)"):
                     st.caption("Elimina la factura y su partida del Libro Diario. Si la compra se registró con líneas de inventario, también revierte las existencias del Kárdex.")
